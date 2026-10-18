@@ -1,6 +1,5 @@
 /** 金额使用规范十进制聪字符串；快照不包含BigInt、时钟或资源句柄。 */
 export type Sats = string;
-export type Preference = "price" | "speed";
 export interface Content { id: string; kind: "seed" | "block"; bytes: number }
 export interface Fees {
   version: number;
@@ -21,12 +20,10 @@ export interface Quote {
 export interface Config {
   /** 系统缺省块价：只是任务未单独设置时使用的缺省值，不是授权上限。 */
   maxBlockPrice: Sats;
-  /** price 策略的独立席位数（无浮动位）。 */
-  priceSeats: number;
-  /** speed 策略的正式席位数。 */
-  speedSeats: number;
-  /** speed 策略额外给未测速新卖家的浮动席位（测速限位）。 */
-  speedFloatingSeats: number;
+  /** 在席卖家数上限的基础名额。 */
+  baseSeats: number;
+  /** 浮动位：在席且没有有效速度档案的卖家不超过该数量。 */
+  floatingSeats: number;
   /** 一个费用池 = 一批 = 一次请求的块数上限，同时是派发粒度。 */
   poolBlocks: number;
   sampleWindowMs: number;
@@ -46,8 +43,12 @@ export interface Sample { start: number; end: number; bytes: number }
 export interface Seller {
   id: string; online: boolean; quote: Quote | null;
   samples: Sample[]; blockedUntil: number;
-  /** 最近一次被席位评审淘汰时的报价版本；同版本不再自动回归，重新报价后才解除。 */
-  evictedVersion: number;
+  /** 确定失败立即拉黑本任务，永不再选；优先于"重新报价可回归"。 */
+  blacklisted: boolean;
+  /** 确定失败累计次数，供审计与展示。 */
+  failureCount: number;
+  /** 最近一次"全程零进度"的时间；窗口内按 0 速参与名次，不算"无档案新人"。 */
+  zeroSpeedAt: number | null;
 }
 export type PoolFunding = "opening" | "open" | "closing" | "closed" | "failed" | "recovery";
 export interface Pool {
@@ -68,7 +69,7 @@ export interface Request {
 }
 export interface State {
   version: 1; taskId: string; seedHash: string; revision: number; sequence: number; now: number;
-  config: Config; preference: Preference; intent: "ready" | "run" | "pause" | "cancel";
+  config: Config; intent: "ready" | "run" | "pause" | "cancel";
   price: Slider;
   /** 当前持有席位的卖家；池关闭与重开之间保持，只在席位评审时变更。 */
   seats: string[];
@@ -80,8 +81,7 @@ export interface State {
 }
 export type Payload =
   | { type: "start" | "pause" | "resume" | "cancel" | "tick" }
-  | { type: "preference"; value: Preference }
-  | { type: "limits"; maxBlockPrice?: Sats; priceSeats?: number; speedSeats?: number; speedFloatingSeats?: number; receiveBytesPerSecond?: number }
+  | { type: "limits"; maxBlockPrice?: Sats; baseSeats?: number; floatingSeats?: number; receiveBytesPerSecond?: number }
   | { type: "slider"; slider: "price"; value: string }
   | { type: "automatic"; slider: "price" }
   | { type: "manifest"; content: Content[]; reused?: string[] }
@@ -116,7 +116,9 @@ export type Command = CommandBase & (
 );
 export interface SliderView {
   mode: "auto" | "manual"; manualValue: string | null;
-  recommended: string | null; effective: string | null;
+  /** 有效值：手动值优先，否则系统缺省。v1 没有自动建议红点。 */
+  effective: string;
+  /** 市场已报价区间，只作事实展示。 */
   range: { min: string; max: string } | null;
 }
 export interface View {
@@ -125,12 +127,12 @@ export interface View {
   content: "manifest-unknown" | "incomplete" | "complete";
   funds: "none" | "pending" | "settled" | "recovery-required";
   price: SliderView;
-  sellerSpeeds: Record<string, { bytesPerSecond: number | null; samples: number; lastAt: number | null }>;
+  sellerSpeeds: Record<string, { bytesPerSecond: number | null; samples: number; lastAt: number | null; zeroSpeed: boolean }>;
   actualBytesPerSecond: number; sustainableBytesPerSecond: number;
   /** 只陈述事实的准入与在途统计，不做任何无数据来源的预测。 */
   facts: {
     eligible: number; aboveCeiling: number; measured: number;
-    unmeasuredEligible: number; inFlight: number;
+    unmeasuredEligible: number; zeroSpeed: number; blacklisted: number; inFlight: number;
   };
   completed: number; total: number; reasons: string[];
   money: { spent: Sats; locked: Sats; committed: Sats; pendingReturn: Sats; arbitrationReserved: Sats; settlementReserved: Sats };

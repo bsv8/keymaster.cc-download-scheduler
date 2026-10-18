@@ -8,34 +8,51 @@ export function availableContent(s: State, q: Quote) {
   return pendingContent(s).filter(c => (!q.contentIds || q.contentIds.includes(c.id))
     && (c.kind === "seed" || !Object.values(s.content).some(x => x.kind === "seed" && !s.completed[x.id])));
 }
+/**
+ * 卖家速度事实：
+ * - 有窗口内样本 → 实测速率；
+ * - 无样本但窗口内有"全程零进度"记录 → 0（参与名次、排最后，且不算无档案新人）；
+ * - 其余 → null（无档案）。
+ */
 export function sellerSpeed(s: State, sellerId: string): number | null {
   const seller = s.sellers[sellerId];
-  return seller ? rate(seller.samples, s.now, s.config.sampleWindowMs, s.config.sampleMaxAgeMs) : null;
+  if (!seller) return null;
+  const measured = rate(seller.samples, s.now, s.config.sampleWindowMs, s.config.sampleMaxAgeMs);
+  if (measured !== null) return measured;
+  if (seller.zeroSpeedAt !== null && s.now - seller.zeroSpeedAt <= s.config.sampleMaxAgeMs) return 0;
+  return null;
+}
+/** 是否有有效速度档案（含零速记录）。 */
+export function hasArchive(s: State, sellerId: string): boolean {
+  return sellerSpeed(s, sellerId) !== null;
+}
+/** 是否需要先用一个真实块探速：无档案或当前档案为零速。 */
+export function needsProbe(s: State, sellerId: string): boolean {
+  return (sellerSpeed(s, sellerId) ?? 0) === 0;
 }
 /** 任务有效价格上限：手动值优先，否则使用系统缺省值。系统缺省不是授权上限。 */
 export function effectivePrice(s: State): bigint {
   return s.price.mode === "manual" && s.price.manualValue !== null
     ? sats(s.price.manualValue) : sats(s.config.maxBlockPrice);
 }
-/** 席位上限：price 策略用独立席位，speed 策略为正式席位加浮动测速席位。 */
+/** 在席卖家总数上限。 */
 export function seatCap(s: State): number {
-  return s.preference === "price" ? s.config.priceSeats : s.config.speedSeats + s.config.speedFloatingSeats;
+  return s.config.baseSeats + s.config.floatingSeats;
 }
-/** 允许同时占用席位的未测速卖家数量：price 无浮动限制，speed 受浮动位限位。 */
+/** 在席且无有效速度档案的卖家上限（浮动位限位）。 */
 export function unmeasuredCap(s: State): number {
-  return s.preference === "price" ? s.config.priceSeats : s.config.speedFloatingSeats;
+  return s.config.floatingSeats;
 }
-/** 市场有效报价：不在价格上限内过滤，仅供区间与事实展示。 */
+/** 市场有效报价：排除黑名单与失去资格的卖家；是否在价格上限内由调用方过滤。 */
 export function validQuotes(s: State): Quote[] {
-  return Object.values(s.sellers).filter(x => x.online && x.blockedUntil <= s.now
-    && (x.evictedVersion ?? 0) < (x.quote?.version ?? 0)).flatMap(seller => {
+  return Object.values(s.sellers).filter(x => x.online && !x.blacklisted && x.blockedUntil <= s.now).flatMap(seller => {
     const pool = Object.values(s.pools).find(p => p.sellerId === seller.id
       && ["open", "opening"].includes(p.funding) && p.scheduling !== "draining");
     const q = pool?.quote ?? seller.quote;
     return q && (pool || q.expiresAt > s.now) && availableContent(s, q).length ? [q] : [];
   });
 }
-/** 可用集合包含仍有效的旧池锁价合同；ceiling 为任务有效价格上限。 */
+/** 准入集合：市场报价中价格不超过有效上限者。 */
 export function candidates(s: State, ceiling: bigint): Quote[] {
   return validQuotes(s).filter(q => sats(q.blockPrice) <= ceiling);
 }
@@ -47,22 +64,16 @@ export function totalSpeed(s: State, quotes: Quote[]): number {
   return Math.min(values.reduce((a, b) => a + b, 0), s.config.receiveBytesPerSecond ?? Infinity);
 }
 
+/** 价格杆视图：v1 没有自动建议，只有系统缺省值与用户手动值。 */
 export function recommendations(s: State): { price: SliderView; quotes: Quote[]; effective: bigint } {
   const effective = effectivePrice(s);
   const market = validQuotes(s).sort(byPrice);
   const quotes = market.filter(q => sats(q.blockPrice) <= effective);
-  // 自动建议只从已报价 / 已实测事实中挑档，不推算未来速度或卖家策略。
-  let recommended: string | null = null;
-  if (market.length) {
-    const measured = market.filter(q => sellerSpeed(s, q.sellerId) !== null);
-    if (s.preference === "speed" && measured.length) {
-      measured.sort((a, b) => (sellerSpeed(s, b.sellerId)! - sellerSpeed(s, a.sellerId)!) || byPrice(a, b));
-      recommended = measured[0].blockPrice;
-    } else recommended = market[0].blockPrice;
-  }
   return {
-    price: { ...s.price, recommended, effective: String(effective),
-      range: market.length ? { min: market[0].blockPrice, max: market.at(-1)!.blockPrice } : null },
+    price: {
+      mode: s.price.mode, manualValue: s.price.manualValue, effective: String(effective),
+      range: market.length ? { min: market[0].blockPrice, max: market.at(-1)!.blockPrice } : null,
+    },
     quotes, effective,
   };
 }
@@ -80,7 +91,7 @@ export function view(s: State): View {
   if (live.some(p => p.funding === "recovery")) reasons.push("recovery-required");
   if (!rec.quotes.length && !complete) reasons.push("no-eligible-seller");
   if (rec.quotes.some(q => sellerSpeed(s, q.sellerId) === null)) reasons.push("speed-unmeasured");
-  if (s.price.mode === "manual" && Object.values(s.sellers).some(x => x.online && x.quote
+  if (s.price.mode === "manual" && Object.values(s.sellers).some(x => x.online && !x.blacklisted && x.quote
     && sats(x.quote.blockPrice) > sats(s.price.manualValue!))) reasons.push("price-limit");
   if (!complete && !requests.length && s.intent === "run") {
     if (live.some(p => p.funding === "opening")) reasons.push("opening");
@@ -99,12 +110,14 @@ export function view(s: State): View {
     costMin += prices.reduce((a, b) => a < b ? a : b);
     costMax += prices.reduce((a, b) => a > b ? a : b);
   }
-  const online = Object.values(s.sellers).filter(x => x.online && x.quote
-    && (x.evictedVersion ?? 0) < x.quote.version);
+  const online = Object.values(s.sellers).filter(x => x.online && !x.blacklisted && x.quote);
   const aboveCeiling = online.filter(x => sats(x.quote!.blockPrice) > rec.effective).length;
   const eligibleIds = new Set(rec.quotes.map(q => q.sellerId));
-  const measured = Object.values(s.sellers).filter(x => sellerSpeed(s, x.id) !== null).length;
+  const speeds = Object.values(s.sellers).map(x => [x.id, sellerSpeed(s, x.id)] as const);
+  const measured = speeds.filter(([, speed]) => speed !== null).length;
+  const zeroSpeed = speeds.filter(([, speed]) => speed === 0).length;
   const unmeasuredEligible = rec.quotes.filter(q => sellerSpeed(s, q.sellerId) === null).length;
+  const blacklisted = Object.values(s.sellers).filter(x => x.blacklisted).length;
   return {
     taskId: s.taskId, revision: s.revision,
     execution: complete ? "finished" : s.intent === "ready" ? "ready"
@@ -118,12 +131,13 @@ export function view(s: State): View {
     price: rec.price,
     sellerSpeeds: Object.fromEntries(Object.values(s.sellers).map(x => [x.id, {
       bytesPerSecond: sellerSpeed(s, x.id), samples: x.samples.length, lastAt: x.samples.at(-1)?.end ?? null,
+      zeroSpeed: sellerSpeed(s, x.id) === 0,
     }])),
     actualBytesPerSecond: s.now > start ? bytes * 1000 / (s.now - start) : 0,
     sustainableBytesPerSecond: sustainable,
     facts: {
       eligible: eligibleIds.size, aboveCeiling, measured,
-      unmeasuredEligible, inFlight: requests.length,
+      unmeasuredEligible, zeroSpeed, blacklisted, inFlight: requests.length,
     },
     completed: Object.keys(s.completed).length, total: Object.keys(s.content).length, reasons,
     money: {

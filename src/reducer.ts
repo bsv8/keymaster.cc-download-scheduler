@@ -24,14 +24,10 @@ export function reduce(s: State, e: Event) {
     case "pause": if (s.intent !== "cancel") s.intent = "pause"; break;
     case "cancel": s.intent = "cancel"; break;
     case "tick": break;
-    case "preference":
-      if (!["price", "speed"].includes(e.value)) throw new Error("Invalid preference");
-      s.preference = e.value; break;
     case "limits":
       if (e.maxBlockPrice !== undefined) { sats(e.maxBlockPrice); s.config.maxBlockPrice = e.maxBlockPrice; }
-      if (e.priceSeats !== undefined) { integer(e.priceSeats, 1); s.config.priceSeats = e.priceSeats; }
-      if (e.speedSeats !== undefined) { integer(e.speedSeats, 1); s.config.speedSeats = e.speedSeats; }
-      if (e.speedFloatingSeats !== undefined) { integer(e.speedFloatingSeats, 1); s.config.speedFloatingSeats = e.speedFloatingSeats; }
+      if (e.baseSeats !== undefined) { integer(e.baseSeats, 1); s.config.baseSeats = e.baseSeats; }
+      if (e.floatingSeats !== undefined) { integer(e.floatingSeats, 1); s.config.floatingSeats = e.floatingSeats; }
       if (e.receiveBytesPerSecond !== undefined) { integer(e.receiveBytesPerSecond, 1); s.config.receiveBytesPerSecond = e.receiveBytesPerSecond; }
       break;
     case "slider":
@@ -45,13 +41,13 @@ export function reduce(s: State, e: Event) {
     case "quote": {
       validateQuote(e.quote);
       const q = e.quote;
-      const seller = s.sellers[q.sellerId] ??= { id: q.sellerId, online: true, quote: null, samples: [], blockedUntil: 0, evictedVersion: 0 };
+      const seller = s.sellers[q.sellerId] ??= { id: q.sellerId, online: true, quote: null, samples: [], blockedUntil: 0, blacklisted: false, failureCount: 0, zeroSpeedAt: null };
       if (!seller.quote || q.version > seller.quote.version) seller.quote = { ...q };
       break;
     }
     case "seller": {
       identity(e.sellerId);
-      const seller = s.sellers[e.sellerId] ??= { id: e.sellerId, online: false, quote: null, samples: [], blockedUntil: 0, evictedVersion: 0 };
+      const seller = s.sellers[e.sellerId] ??= { id: e.sellerId, online: false, quote: null, samples: [], blockedUntil: 0, blacklisted: false, failureCount: 0, zeroSpeedAt: null };
       seller.online = e.online; break;
     }
     case "wallet":
@@ -119,6 +115,9 @@ export function reduce(s: State, e: Event) {
       s.spent = String(sats(s.spent) + expected);
       r.state = "settled"; p.requestId = null;
       for (const id of e.accepted) s.completed[id] = "purchased";
+      // 确定失败：验收为空（坏块 / 内容校验失败）→ 本任务立即拉黑该卖家。
+      if (!e.accepted.length) { s.sellers[p.sellerId].blacklisted = true; s.sellers[p.sellerId].failureCount++; }
+      else s.sellers[p.sellerId].zeroSpeedAt = null;
       const bytes = e.accepted.filter(id => s.content[id].kind === "block").reduce((n, id) => n + s.content[id].bytes, 0);
       if (bytes) {
         const sample = { bytes, start: e.startedAt, end: e.endedAt };
@@ -138,7 +137,9 @@ export function reduce(s: State, e: Event) {
         p.scheduling = "draining"; p.drainReason = "request-rejected";
         s.sellers[p.sellerId].blockedUntil = s.now + s.config.retryMs;
       }
-      else { r.state = "unresolved"; p.funding = "recovery"; p.recoveryAt = s.now; }
+      else { r.state = "unresolved"; p.funding = "recovery"; p.recoveryAt = s.now;
+        // 不可重试的拒绝是确定失败：本任务立即拉黑该卖家。
+        s.sellers[p.sellerId].blacklisted = true; s.sellers[p.sellerId].failureCount++; }
       break;
     }
     case "closed": {

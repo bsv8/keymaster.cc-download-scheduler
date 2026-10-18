@@ -1,4 +1,4 @@
-import { byPrice, availableContent, pendingContent, recommendations, sellerSpeed, seatCap, unmeasuredCap, view } from "./recommend.js";
+import { availableContent, hasArchive, needsProbe, pendingContent, recommendations, seatCap, sellerSpeed, unmeasuredCap, view } from "./recommend.js";
 import { identity, integer, price, reserve, sats, validateFees, validateQuote } from "./math.js";
 import { addContent, assertRequestPrices, reduce } from "./reducer.js";
 import type { Command, Config, Content, Event, Pool, Quote, Result, State } from "./types.js";
@@ -6,19 +6,19 @@ import type { Command, Config, Content, Event, Pool, Quote, Result, State } from
 function clone<T>(value: T): T { return JSON.parse(JSON.stringify(value)) as T; }
 function validateConfig(c: Config) {
   sats(c.maxBlockPrice);
-  for (const value of [c.priceSeats, c.speedSeats, c.speedFloatingSeats, c.poolBlocks, c.sampleWindowMs,
+  for (const value of [c.baseSeats, c.floatingSeats, c.poolBlocks, c.sampleWindowMs,
     c.sampleMaxAgeMs, c.requestTimeoutMs, c.recoveryRetryMs, c.retryMs]) integer(value, 1);
   if (c.receiveBytesPerSecond !== undefined) integer(c.receiveBytesPerSecond, 1);
 }
 export function createTask(input: {
   taskId: string; seedHash: string; config: Config; content: Content[];
-  manifestKnown: boolean; reused?: string[]; preference?: "price" | "speed";
+  manifestKnown: boolean; reused?: string[];
 }): State {
   identity(input.taskId); identity(input.seedHash);
   validateConfig(input.config);
   const state: State = {
     version: 1, taskId: input.taskId, seedHash: input.seedHash, revision: 0, sequence: 0, now: 0,
-    config: clone(input.config), preference: input.preference ?? "price", intent: "ready",
+    config: clone(input.config), intent: "ready",
     price: { mode: "auto", manualValue: null }, seats: [],
     manifestKnown: input.manifestKnown, content: {}, completed: {}, sellers: {}, pools: {}, requests: {},
     wallet: { revision: -1, available: "0", reflectedCommands: [] }, spent: "0", actualSamples: [], seenEvents: {},
@@ -33,11 +33,12 @@ export function restoreTask(snapshot: State): State {
   if (s.version !== 1 || !s.taskId || !s.seedHash) throw new Error("Unsupported task snapshot");
   validateConfig(s.config); integer(s.now); integer(s.revision); integer(s.sequence);
   identity(s.taskId); identity(s.seedHash);
-  if (!["ready", "run", "pause", "cancel"].includes(s.intent) || !["price", "speed"].includes(s.preference)) throw new Error("Invalid snapshot intent");
+  if (!["ready", "run", "pause", "cancel"].includes(s.intent)) throw new Error("Invalid snapshot intent");
   sats(s.spent); sats(s.wallet.available);
   if (!s.price || !["auto", "manual"].includes(s.price.mode)) throw new Error("Invalid snapshot slider");
   if (s.price.manualValue !== null) sats(s.price.manualValue);
   if (s.price.mode === "manual" && s.price.manualValue === null) throw new Error("Missing manual target");
+  if (!Array.isArray(s.seats)) throw new Error("Invalid snapshot seats");
   for (const id of s.seats) { identity(id); if (!s.sellers[id]) throw new Error("Unknown seat seller"); }
   for (const [key, c] of Object.entries(s.content)) if (key !== c.id) throw new Error("Content key mismatch");
   addContent(s, Object.values(s.content));
@@ -46,8 +47,11 @@ export function restoreTask(snapshot: State): State {
     identity(id);
     if (id !== seller.id) throw new Error("Seller key mismatch");
     if (seller.quote) { validateQuote(seller.quote); if (seller.quote.sellerId !== id) throw new Error("Quote seller mismatch"); }
-    if (seller.evictedVersion !== undefined) integer(seller.evictedVersion, 0);
-    seller.evictedVersion ??= 0;
+    seller.blacklisted ??= false;
+    if (typeof seller.blacklisted !== "boolean") throw new Error("Invalid blacklist flag");
+    if (seller.failureCount !== undefined) integer(seller.failureCount, 0);
+    seller.failureCount ??= 0;
+    if (seller.zeroSpeedAt !== undefined && seller.zeroSpeedAt !== null) integer(seller.zeroSpeedAt, 0);
     for (const sample of seller.samples) {
       integer(sample.start); integer(sample.end, sample.start + 1); integer(sample.bytes, 1);
       if (sample.end > s.now) throw new Error("Future speed sample");
@@ -95,48 +99,42 @@ function walletFree(s: State): bigint {
     .reduce((n, p) => n + sats(p.amount) + sats(p.quote.fees.opening), 0n);
   return sats(s.wallet.available) - unreflected;
 }
-function hasInFlight(s: State, sellerId: string) {
-  return Object.values(s.pools).some(p => p.sellerId === sellerId && live(p) && p.requestId !== null);
-}
-
-/** 准入排序：price 用价格升序；speed 先按实测速度降序，未测速的按价格升序补浮动位。 */
-function admissionOrder(s: State, a: Quote, b: Quote): number {
-  if (s.preference === "price") return byPrice(a, b);
-  const sa = sellerSpeed(s, a.sellerId), sb = sellerSpeed(s, b.sellerId);
-  if (sa !== null && sb !== null) return (sb - sa) || byPrice(a, b);
-  if (sa !== null) return -1;
-  if (sb !== null) return 1;
-  return byPrice(a, b);
+/** 确定性伪随机：同一状态与候选集合在重放中必然选中同一卖家。 */function pickRandom(s: State, ids: string[]): string {
+  const sorted = [...ids].sort();
+  let h = 2166136261;
+  const seed = `${s.taskId}|${s.sequence}|${sorted.join(",")}`;
+  for (let i = 0; i < seed.length; i++) { h ^= seed.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; }
+  return sorted[h % sorted.length];
 }
 
 /**
  * 席位评审：只在费用池"下载完成并进入 drain"的那一刻发生。
- * price：席位满时，用最便宜的闲置卖家与刚 drain 的卖家一比一比较，便宜才换。
- * speed：踢位数 = 在席数 − 正式席位（上限浮动位）；只踢本轮可淘汰的末位，未测速/在途受保护。
+ * 排名集合 = 在席且有有效速度档案的卖家（在途者只参与算名次）。
+ * 名次 ≤ 基础名额 → 保留；名次 > 基础名额 → 一换一：
+ *   a. 闲置有档案卖家里最快且比它快 → 替换；
+ *   b. 否则有未测速闲置且浮动位未满 → 随机挑一名替换；
+ *   c. 否则不换，续约。
  */
-function reviewSeats(s: State, desired: Set<string>, qualified: Quote[], commands: Command[]) {
-  const waiting = qualified.filter(q => !desired.has(q.sellerId));
-  if (!waiting.length) return;
-  if (s.preference === "price") {
-    if (desired.size < s.config.priceSeats) return;
-    const cheapest = [...waiting].sort(byPrice)[0];
-    for (const id of [...desired]) {
-      const draining = Object.values(s.pools).find(p => p.sellerId === id && live(p) && p.scheduling === "draining");
-      if (draining && sats(draining.quote.blockPrice) > sats(cheapest.blockPrice)) {
-        desired.delete(id); s.sellers[id].evictedVersion = s.sellers[id].quote?.version ?? 0; return;
-      }
+function reviewSeats(s: State, desired: Set<string>, qualified: Quote[]) {
+  const drainSellers = [...desired].filter(id =>
+    Object.values(s.pools).some(p => p.sellerId === id && live(p) && p.scheduling === "draining"));
+  for (const drainSeller of drainSellers) {
+    if (!desired.has(drainSeller) || !hasArchive(s, drainSeller)) continue;
+    const ranked = [...desired].filter(id => hasArchive(s, id))
+      .sort((a, b) => (sellerSpeed(s, b)! - sellerSpeed(s, a)!) || a.localeCompare(b));
+    const rank = ranked.indexOf(drainSeller) + 1;
+    if (rank <= s.config.baseSeats) continue;
+    const idle = qualified.filter(q => !desired.has(q.sellerId));
+    const measuredIdle = idle.filter(q => hasArchive(s, q.sellerId))
+      .sort((a, b) => (sellerSpeed(s, b.sellerId)! - sellerSpeed(s, a.sellerId)!) || a.sellerId.localeCompare(b.sellerId));
+    if (measuredIdle.length && sellerSpeed(s, measuredIdle[0].sellerId)! > sellerSpeed(s, drainSeller)!) {
+      desired.delete(drainSeller); desired.add(measuredIdle[0].sellerId); continue;
     }
-    return;
-  }
-  const quota = Math.min(Math.max(desired.size - s.config.speedSeats, 0), s.config.speedFloatingSeats);
-  if (quota <= 0) return;
-  const evictable = [...desired].filter(id => !hasInFlight(s, id) && sellerSpeed(s, id) !== null);
-  evictable.sort((a, b) => (sellerSpeed(s, a)! - sellerSpeed(s, b)!) || a.localeCompare(b));
-  const count = Math.min(quota, evictable.length, waiting.length);
-  for (const id of evictable.slice(0, count)) {
-    desired.delete(id);
-    s.sellers[id].evictedVersion = s.sellers[id].quote?.version ?? 0;
-    for (const p of Object.values(s.pools)) if (p.sellerId === id && live(p)) drain(s, p, commands, "seat-review");
+    const unmeasuredInSeat = [...desired].filter(id => !hasArchive(s, id)).length;
+    const unmeasuredIdle = idle.filter(q => !hasArchive(s, q.sellerId)).map(q => q.sellerId);
+    if (unmeasuredIdle.length && unmeasuredInSeat < s.config.floatingSeats) {
+      desired.delete(drainSeller); desired.add(pickRandom(s, unmeasuredIdle)); continue;
+    }
   }
 }
 
@@ -146,6 +144,8 @@ function plan(s: State): Command[] {
     if (r.state === "pending" && s.now >= r.lastProgressAt + s.config.requestTimeoutMs) {
       r.state = "unresolved";
       const p = s.pools[r.poolId]; p.funding = "recovery"; p.recoveryAt = s.now;
+      // 全程零进度就超时属于网络问题：记零速事实，不拉黑、也不当作无档案新人。
+      if (r.transferredBytes === 0) s.sellers[p.sellerId].zeroSpeedAt = s.now;
     }
   }
   for (const p of Object.values(s.pools)) if (p.funding === "recovery" && p.recoveryAt <= s.now) {
@@ -175,10 +175,10 @@ function plan(s: State): Command[] {
     // 锁价合同可以在原报价过期后继续使用；新请求仍受当前有效价格上限约束。
     if (sats(p.quote.blockPrice) > rec.effective) continue;
     let items = availableContent(s, p.quote).filter(c => !claimed.has(c.id));
-    const unmeasured = sellerSpeed(s, p.sellerId) === null;
+    const probe = needsProbe(s, p.sellerId);
     if (items.length) {
       const seedFirst = items[0].kind === "seed";
-      const limit = seedFirst || unmeasured ? 1 : Math.max(0, p.blockCapacity - p.purchasedBlocks);
+      const limit = seedFirst || probe ? 1 : Math.max(0, p.blockCapacity - p.purchasedBlocks);
       items = items.slice(0, limit);
     }
     while (items.length && items.reduce((n, c) => n + price(p.quote, c), 0n)
@@ -192,7 +192,7 @@ function plan(s: State): Command[] {
     }
     const requestId = nextId(s, "request");
     const prices = Object.fromEntries(items.map(c => [c.id, String(price(p.quote, c))]));
-    const command: Command = { ...base(s, unmeasured || items[0].kind === "seed" ? "probe-real-content" : "continue"),
+    const command: Command = { ...base(s, probe || items[0].kind === "seed" ? "probe-real-content" : "continue"),
       type: "download", poolId: p.id, requestId, contentIds: items.map(c => c.id), prices,
       maxPayment: String(Object.values(prices).reduce((n, v) => n + sats(v), 0n)),
       priceLimit: String(rec.effective), feeVersion: p.fees.version };
@@ -205,7 +205,7 @@ function plan(s: State): Command[] {
   }
 
   // 只有发生"池下载完成并进入 drain"时，才做一次席位评审；不在每个事件全量重排。
-  if (capacityDrain && enabled) reviewSeats(s, desired, qualified, commands);
+  if (capacityDrain && enabled) reviewSeats(s, desired, qualified);
 
   for (const p of livePools) {
     if (!enabled) { drain(s, p, commands, complete ? "content-complete" : s.intent); continue; }
@@ -225,21 +225,18 @@ function plan(s: State): Command[] {
   }
 
   if (enabled && !awaitingManifest) {
-    // 补席位：未满时合格卖家直接入场；speed 策略下未测速卖家受浮动位限位。
+    // 补席位：有档案者按速度降序优先；无档案者随机补浮动位。
     const cap = seatCap(s);
-    let unmeasured = [...desired].filter(id => sellerSpeed(s, id) === null).length;
     if (desired.size < cap) {
-      const waiting = qualified.filter(q => !desired.has(q.sellerId)).sort((a, b) => admissionOrder(s, a, b));
-      const umCap = unmeasuredCap(s);
-      for (const q of waiting) {
-        if (desired.size >= cap) break;
-        const seller = s.sellers[q.sellerId];
-        // 本轮刚刚被淘汰的卖家不能在同一计划里重新入场。
-        if ((seller.evictedVersion ?? 0) >= q.version) continue;
-        const measured = sellerSpeed(s, q.sellerId) !== null;
-        if (!measured && unmeasured >= umCap) continue;
-        desired.add(q.sellerId);
-        if (!measured) unmeasured++;
+      const measuredIdle = qualified.filter(q => !desired.has(q.sellerId) && hasArchive(s, q.sellerId))
+        .sort((a, b) => (sellerSpeed(s, b.sellerId)! - sellerSpeed(s, a.sellerId)!) || a.sellerId.localeCompare(b.sellerId));
+      for (const q of measuredIdle) { if (desired.size >= cap) break; desired.add(q.sellerId); }
+      let unmeasured = [...desired].filter(id => !hasArchive(s, id)).length;
+      const unmeasuredIdle = qualified.filter(q => !desired.has(q.sellerId) && !hasArchive(s, q.sellerId)).map(q => q.sellerId);
+      while (desired.size < cap && unmeasured < unmeasuredCap(s) && unmeasuredIdle.length) {
+        const chosen = pickRandom(s, unmeasuredIdle);
+        unmeasuredIdle.splice(unmeasuredIdle.indexOf(chosen), 1);
+        desired.add(chosen); unmeasured++;
       }
     }
     for (const id of desired) {
@@ -289,6 +286,7 @@ function nextWakeAt(s: State): number | null {
     if (seller.blockedUntil > s.now) times.push(seller.blockedUntil);
     const sample = seller.samples.at(-1);
     if (sample && sample.end + s.config.sampleMaxAgeMs + 1 > s.now) times.push(sample.end + s.config.sampleMaxAgeMs + 1);
+    if (seller.zeroSpeedAt !== null && seller.zeroSpeedAt + s.config.sampleMaxAgeMs + 1 > s.now) times.push(seller.zeroSpeedAt + s.config.sampleMaxAgeMs + 1);
   }
   for (const p of Object.values(s.pools)) {
     if ((p.funding === "opening" || p.funding === "closing" || p.funding === "recovery") && p.recoveryAt > s.now) times.push(p.recoveryAt);
