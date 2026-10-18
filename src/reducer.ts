@@ -29,30 +29,29 @@ export function reduce(s: State, e: Event) {
       s.preference = e.value; break;
     case "limits":
       if (e.maxBlockPrice !== undefined) { sats(e.maxBlockPrice); s.config.maxBlockPrice = e.maxBlockPrice; }
-      if (e.maxTotalSpend !== undefined) { sats(e.maxTotalSpend); s.config.maxTotalSpend = e.maxTotalSpend; }
-      if (e.maxPools !== undefined) { integer(e.maxPools, 1); s.config.maxPools = e.maxPools; }
+      if (e.priceSeats !== undefined) { integer(e.priceSeats, 1); s.config.priceSeats = e.priceSeats; }
+      if (e.speedSeats !== undefined) { integer(e.speedSeats, 1); s.config.speedSeats = e.speedSeats; }
+      if (e.speedFloatingSeats !== undefined) { integer(e.speedFloatingSeats, 1); s.config.speedFloatingSeats = e.speedFloatingSeats; }
       if (e.receiveBytesPerSecond !== undefined) { integer(e.receiveBytesPerSecond, 1); s.config.receiveBytesPerSecond = e.receiveBytesPerSecond; }
       break;
     case "slider":
       sats(e.value);
-      if (!["price", "speed"].includes(e.slider)) throw new Error("Invalid slider");
-      if (e.slider === "price" && sats(e.value) > sats(s.config.maxBlockPrice)) throw new Error("Price exceeds authorization");
-      if (e.slider === "speed") integer(Number(e.value), 1);
-      s[e.slider] = { mode: "manual", manualValue: e.value }; break;
+      if (e.slider !== "price") throw new Error("Invalid slider");
+      s.price = { mode: "manual", manualValue: e.value }; break;
     case "automatic":
-      if (!["price", "speed"].includes(e.slider)) throw new Error("Invalid slider");
-      s[e.slider].mode = "auto"; break;
+      if (e.slider !== "price") throw new Error("Invalid slider");
+      s.price.mode = "auto"; break;
     case "manifest": addContent(s, e.content, e.reused); s.manifestKnown = true; break;
     case "quote": {
       validateQuote(e.quote);
       const q = e.quote;
-      const seller = s.sellers[q.sellerId] ??= { id: q.sellerId, online: true, quote: null, samples: [], blockedUntil: 0 };
+      const seller = s.sellers[q.sellerId] ??= { id: q.sellerId, online: true, quote: null, samples: [], blockedUntil: 0, evictedVersion: 0 };
       if (!seller.quote || q.version > seller.quote.version) seller.quote = { ...q };
       break;
     }
     case "seller": {
       identity(e.sellerId);
-      const seller = s.sellers[e.sellerId] ??= { id: e.sellerId, online: false, quote: null, samples: [], blockedUntil: 0 };
+      const seller = s.sellers[e.sellerId] ??= { id: e.sellerId, online: false, quote: null, samples: [], blockedUntil: 0, evictedVersion: 0 };
       seller.online = e.online; break;
     }
     case "wallet":

@@ -12,51 +12,58 @@ export function sellerSpeed(s: State, sellerId: string): number | null {
   const seller = s.sellers[sellerId];
   return seller ? rate(seller.samples, s.now, s.config.sampleWindowMs, s.config.sampleMaxAgeMs) : null;
 }
-/** 可用集合包含仍有效的旧池锁价合同，即使原报价已经过期。 */
-export function candidates(s: State): Quote[] {
-  return Object.values(s.sellers).filter(x => x.online && x.blockedUntil <= s.now).flatMap(seller => {
+/** 任务有效价格上限：手动值优先，否则使用系统缺省值。系统缺省不是授权上限。 */
+export function effectivePrice(s: State): bigint {
+  return s.price.mode === "manual" && s.price.manualValue !== null
+    ? sats(s.price.manualValue) : sats(s.config.maxBlockPrice);
+}
+/** 席位上限：price 策略用独立席位，speed 策略为正式席位加浮动测速席位。 */
+export function seatCap(s: State): number {
+  return s.preference === "price" ? s.config.priceSeats : s.config.speedSeats + s.config.speedFloatingSeats;
+}
+/** 允许同时占用席位的未测速卖家数量：price 无浮动限制，speed 受浮动位限位。 */
+export function unmeasuredCap(s: State): number {
+  return s.preference === "price" ? s.config.priceSeats : s.config.speedFloatingSeats;
+}
+/** 市场有效报价：不在价格上限内过滤，仅供区间与事实展示。 */
+export function validQuotes(s: State): Quote[] {
+  return Object.values(s.sellers).filter(x => x.online && x.blockedUntil <= s.now
+    && (x.evictedVersion ?? 0) < (x.quote?.version ?? 0)).flatMap(seller => {
     const pool = Object.values(s.pools).find(p => p.sellerId === seller.id
       && ["open", "opening"].includes(p.funding) && p.scheduling !== "draining");
     const q = pool?.quote ?? seller.quote;
-    return q && (pool || q.expiresAt > s.now) && sats(q.blockPrice) <= sats(s.config.maxBlockPrice)
-      && availableContent(s, q).length ? [q] : [];
+    return q && (pool || q.expiresAt > s.now) && availableContent(s, q).length ? [q] : [];
   });
 }
-const byPrice = (a: Quote, b: Quote) => sats(a.blockPrice) < sats(b.blockPrice) ? -1
+/** 可用集合包含仍有效的旧池锁价合同；ceiling 为任务有效价格上限。 */
+export function candidates(s: State, ceiling: bigint): Quote[] {
+  return validQuotes(s).filter(q => sats(q.blockPrice) <= ceiling);
+}
+export const byPrice = (a: Quote, b: Quote) => sats(a.blockPrice) < sats(b.blockPrice) ? -1
   : sats(a.blockPrice) > sats(b.blockPrice) ? 1 : a.sellerId.localeCompare(b.sellerId);
 
 export function totalSpeed(s: State, quotes: Quote[]): number {
-  const values = [...new Set(quotes.map(q => q.sellerId))].map(id => sellerSpeed(s, id) ?? 0)
-    .sort((a, b) => b - a).slice(0, s.config.maxPools);
+  const values = [...new Set(quotes.map(q => q.sellerId))].map(id => sellerSpeed(s, id) ?? 0);
   return Math.min(values.reduce((a, b) => a + b, 0), s.config.receiveBytesPerSecond ?? Infinity);
 }
 
-export function recommendations(s: State): { price: SliderView; speed: SliderView; quotes: Quote[] } {
-  const quotes = candidates(s).sort(byPrice);
-  const ceiling = s.price.mode === "manual" ? sats(s.price.manualValue!) : sats(s.config.maxBlockPrice);
-  let recommendedPrice: string | null = null;
-  if (quotes.length) {
-    if (s.speed.mode === "manual") {
-      const target = Number(s.speed.manualValue);
-      recommendedPrice = quotes.at(-1)!.blockPrice;
-      for (const q of quotes) {
-        if (totalSpeed(s, quotes.filter(x => sats(x.blockPrice) <= sats(q.blockPrice))) >= target) {
-          recommendedPrice = q.blockPrice; break;
-        }
-      }
-    } else recommendedPrice = s.preference === "price" ? quotes[0].blockPrice : quotes.at(-1)!.blockPrice;
+export function recommendations(s: State): { price: SliderView; quotes: Quote[]; effective: bigint } {
+  const effective = effectivePrice(s);
+  const market = validQuotes(s).sort(byPrice);
+  const quotes = market.filter(q => sats(q.blockPrice) <= effective);
+  // 自动建议只从已报价 / 已实测事实中挑档，不推算未来速度或卖家策略。
+  let recommended: string | null = null;
+  if (market.length) {
+    const measured = market.filter(q => sellerSpeed(s, q.sellerId) !== null);
+    if (s.preference === "speed" && measured.length) {
+      measured.sort((a, b) => (sellerSpeed(s, b.sellerId)! - sellerSpeed(s, a.sellerId)!) || byPrice(a, b));
+      recommended = measured[0].blockPrice;
+    } else recommended = market[0].blockPrice;
   }
-  const effectivePrice = s.price.mode === "manual" ? s.price.manualValue : recommendedPrice;
-  const eligible = quotes.filter(q => sats(q.blockPrice) <= (effectivePrice === null ? ceiling : sats(effectivePrice)));
-  const measured = totalSpeed(s, eligible);
-  const recommendedSpeed = eligible.some(q => sellerSpeed(s, q.sellerId) !== null) ? String(Math.floor(measured)) : null;
   return {
-    price: { ...s.price, recommended: recommendedPrice, effective: effectivePrice,
-      range: quotes.length ? { min: quotes[0].blockPrice, max: quotes.at(-1)!.blockPrice } : null },
-    speed: { ...s.speed, recommended: recommendedSpeed,
-      effective: s.speed.mode === "manual" ? s.speed.manualValue : recommendedSpeed,
-      range: recommendedSpeed === null ? null : { min: "0", max: recommendedSpeed } },
-    quotes: eligible,
+    price: { ...s.price, recommended, effective: String(effective),
+      range: market.length ? { min: market[0].blockPrice, max: market.at(-1)!.blockPrice } : null },
+    quotes, effective,
   };
 }
 
@@ -73,7 +80,6 @@ export function view(s: State): View {
   if (live.some(p => p.funding === "recovery")) reasons.push("recovery-required");
   if (!rec.quotes.length && !complete) reasons.push("no-eligible-seller");
   if (rec.quotes.some(q => sellerSpeed(s, q.sellerId) === null)) reasons.push("speed-unmeasured");
-  if (rec.speed.effective !== null && totalSpeed(s, rec.quotes) < Number(rec.speed.effective)) reasons.push("speed-target-unreachable");
   if (s.price.mode === "manual" && Object.values(s.sellers).some(x => x.online && x.quote
     && sats(x.quote.blockPrice) > sats(s.price.manualValue!))) reasons.push("price-limit");
   if (!complete && !requests.length && s.intent === "run") {
@@ -84,7 +90,6 @@ export function view(s: State): View {
   const recent = s.actualSamples.filter(x => x.end > s.now - s.config.sampleWindowMs);
   const start = Math.max(s.now - s.config.sampleWindowMs, Math.min(s.now, ...recent.map(x => x.start)));
   const bytes = recent.reduce((n, x) => n + x.bytes * (x.end - Math.max(start, x.start)) / (x.end - x.start), 0);
-  const remainingBytes = pendingContent(s).reduce((n, x) => n + x.bytes, 0);
   let costMin = 0n, costMax = 0n, covered = true;
   for (const item of pendingContent(s)) {
     const request = Object.values(s.requests).find(r => ["pending", "unresolved"].includes(r.state) && r.contentIds.includes(item.id));
@@ -94,6 +99,12 @@ export function view(s: State): View {
     costMin += prices.reduce((a, b) => a < b ? a : b);
     costMax += prices.reduce((a, b) => a > b ? a : b);
   }
+  const online = Object.values(s.sellers).filter(x => x.online && x.quote
+    && (x.evictedVersion ?? 0) < x.quote.version);
+  const aboveCeiling = online.filter(x => sats(x.quote!.blockPrice) > rec.effective).length;
+  const eligibleIds = new Set(rec.quotes.map(q => q.sellerId));
+  const measured = Object.values(s.sellers).filter(x => sellerSpeed(s, x.id) !== null).length;
+  const unmeasuredEligible = rec.quotes.filter(q => sellerSpeed(s, q.sellerId) === null).length;
   return {
     taskId: s.taskId, revision: s.revision,
     execution: complete ? "finished" : s.intent === "ready" ? "ready"
@@ -104,12 +115,16 @@ export function view(s: State): View {
     funds: live.some(p => p.funding === "recovery") ? "recovery-required"
       : live.length || pools.some(p => p.funding === "closed" && !p.refundAvailable) ? "pending"
       : pools.length ? "settled" : "none",
-    price: rec.price, speed: rec.speed,
+    price: rec.price,
     sellerSpeeds: Object.fromEntries(Object.values(s.sellers).map(x => [x.id, {
       bytesPerSecond: sellerSpeed(s, x.id), samples: x.samples.length, lastAt: x.samples.at(-1)?.end ?? null,
     }])),
     actualBytesPerSecond: s.now > start ? bytes * 1000 / (s.now - start) : 0,
     sustainableBytesPerSecond: sustainable,
+    facts: {
+      eligible: eligibleIds.size, aboveCeiling, measured,
+      unmeasuredEligible, inFlight: requests.length,
+    },
     completed: Object.keys(s.completed).length, total: Object.keys(s.content).length, reasons,
     money: {
       spent: s.spent,
@@ -121,8 +136,6 @@ export function view(s: State): View {
         + sats(p.fees.arbitrationPerItem) * BigInt(p.requestId ? s.requests[p.requestId].contentIds.length : 1), 0n)),
       settlementReserved: String(live.reduce((n, p) => n + sats(p.fees.settlement), 0n)),
     },
-    estimatedRemainingSeconds: sustainable > 0 ? remainingBytes / sustainable : null,
     estimatedRemainingContent: covered && s.manifestKnown ? { min: String(costMin), max: String(costMax) } : null,
   };
 }
-

@@ -14,17 +14,21 @@ export interface Quote {
   expiresAt: number; blockPrice: Sats; seedPrice: Sats; blockBytes: number;
   /** 可选的协议尾块报价；未提供时按字节比例向上取整。 */
   tailPrice?: Sats;
-  minBlocks: number; maxBlocks: number; fees: Fees;
+  maxBlocks: number; fees: Fees;
   /** 未指定时表示拥有全部内容；已开池保留绑定价格。 */
   contentIds?: string[];
 }
 export interface Config {
-  /** 宿主明确给出的授权，两个自动控制器均不能自行提高。 */
+  /** 系统缺省块价：只是任务未单独设置时使用的缺省值，不是授权上限。 */
   maxBlockPrice: Sats;
-  maxTotalSpend: Sats;
-  maxPools: number;
+  /** price 策略的独立席位数（无浮动位）。 */
+  priceSeats: number;
+  /** speed 策略的正式席位数。 */
+  speedSeats: number;
+  /** speed 策略额外给未测速新卖家的浮动席位（测速限位）。 */
+  speedFloatingSeats: number;
+  /** 一个费用池 = 一批 = 一次请求的块数上限，同时是派发粒度。 */
   poolBlocks: number;
-  batchBlocks: number;
   sampleWindowMs: number;
   sampleMaxAgeMs: number;
   requestTimeoutMs: number;
@@ -42,6 +46,8 @@ export interface Sample { start: number; end: number; bytes: number }
 export interface Seller {
   id: string; online: boolean; quote: Quote | null;
   samples: Sample[]; blockedUntil: number;
+  /** 最近一次被席位评审淘汰时的报价版本；同版本不再自动回归，重新报价后才解除。 */
+  evictedVersion: number;
 }
 export type PoolFunding = "opening" | "open" | "closing" | "closed" | "failed" | "recovery";
 export interface Pool {
@@ -63,7 +69,9 @@ export interface Request {
 export interface State {
   version: 1; taskId: string; seedHash: string; revision: number; sequence: number; now: number;
   config: Config; preference: Preference; intent: "ready" | "run" | "pause" | "cancel";
-  price: Slider; speed: Slider;
+  price: Slider;
+  /** 当前持有席位的卖家；池关闭与重开之间保持，只在席位评审时变更。 */
+  seats: string[];
   manifestKnown: boolean; content: Record<string, Content>;
   completed: Record<string, "reused" | "purchased">;
   sellers: Record<string, Seller>; pools: Record<string, Pool>; requests: Record<string, Request>;
@@ -73,9 +81,9 @@ export interface State {
 export type Payload =
   | { type: "start" | "pause" | "resume" | "cancel" | "tick" }
   | { type: "preference"; value: Preference }
-  | { type: "limits"; maxBlockPrice?: Sats; maxTotalSpend?: Sats; maxPools?: number; receiveBytesPerSecond?: number }
-  | { type: "slider"; slider: "price" | "speed"; value: string }
-  | { type: "automatic"; slider: "price" | "speed" }
+  | { type: "limits"; maxBlockPrice?: Sats; priceSeats?: number; speedSeats?: number; speedFloatingSeats?: number; receiveBytesPerSecond?: number }
+  | { type: "slider"; slider: "price"; value: string }
+  | { type: "automatic"; slider: "price" }
   | { type: "manifest"; content: Content[]; reused?: string[] }
   | { type: "quote"; quote: Quote }
   | { type: "seller"; sellerId: string; online: boolean }
@@ -116,12 +124,16 @@ export interface View {
   execution: "ready" | "running" | "waiting" | "paused" | "stopping" | "stopped" | "finished";
   content: "manifest-unknown" | "incomplete" | "complete";
   funds: "none" | "pending" | "settled" | "recovery-required";
-  price: SliderView; speed: SliderView;
+  price: SliderView;
   sellerSpeeds: Record<string, { bytesPerSecond: number | null; samples: number; lastAt: number | null }>;
   actualBytesPerSecond: number; sustainableBytesPerSecond: number;
+  /** 只陈述事实的准入与在途统计，不做任何无数据来源的预测。 */
+  facts: {
+    eligible: number; aboveCeiling: number; measured: number;
+    unmeasuredEligible: number; inFlight: number;
+  };
   completed: number; total: number; reasons: string[];
   money: { spent: Sats; locked: Sats; committed: Sats; pendingReturn: Sats; arbitrationReserved: Sats; settlementReserved: Sats };
-  estimatedRemainingSeconds: number | null;
   /** 按报价估算的内容费区间，不承诺未来支出；其他费用分开展示。 */
   estimatedRemainingContent: { min: Sats; max: Sats } | null;
 }

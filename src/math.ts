@@ -28,7 +28,7 @@ export function validateQuote(q: Quote) {
   identity(q.id); identity(q.sellerId); identity(q.sessionId);
   for (const id of q.contentIds ?? []) identity(id);
   integer(q.version); integer(q.expiresAt); integer(q.blockBytes, 1);
-  integer(q.minBlocks, 1); integer(q.maxBlocks, q.minBlocks);
+  integer(q.maxBlocks, 1);
   sats(q.blockPrice); sats(q.seedPrice);
   if (q.tailPrice !== undefined) sats(q.tailPrice);
   validateFees(q.fees);
