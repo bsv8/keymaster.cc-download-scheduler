@@ -1,0 +1,11 @@
+{
+  "name": "keymaster.cc-download-scheduler",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Deterministic, task-oriented download and funding-pool decisions",
+  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
+  "files": ["dist", "README.md", "LICENSE"],
+  "scripts": { "build": "tsc -p tsconfig.json", "typecheck": "tsc -p tsconfig.json --noEmit" },
+  "devDependencies": { "typescript": "5.9.3" }
+}
