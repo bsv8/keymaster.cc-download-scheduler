@@ -1,14 +1,12 @@
 import { availableContent, hasArchive, pendingContent, recommendations, seatCap, sellerSpeed, unmeasuredCap, view } from "./recommend.js";
 import { identity, integer, price, reserve, sats, validateFees, validateQuote } from "./math.js";
-import { addContent, assertRequestPrices, reduce } from "./reducer.js";
+import { addContent, assertRequestPrices, recordFailedAttempt, reduce } from "./reducer.js";
 import type { Command, Config, Content, Event, Pool, Quote, Result, State } from "./types.js";
 
 function clone<T>(value: T): T { return JSON.parse(JSON.stringify(value)) as T; }
 function validateConfig(c: Config) {
   sats(c.maxBlockPrice);
-  for (const value of [c.baseSeats, c.floatingSeats, c.poolBlocks, c.sampleWindowMs,
-    c.sampleMaxAgeMs, c.requestTimeoutMs, c.recoveryRetryMs, c.retryMs]) integer(value, 1);
-  if (c.receiveBytesPerSecond !== undefined) integer(c.receiveBytesPerSecond, 1);
+  for (const value of [c.baseSeats, c.floatingSeats, c.poolBlocks, c.requestTimeoutMs]) integer(value, 1);
 }
 export function createTask(input: {
   taskId: string; seedHash: string; config: Config; content: Content[];
@@ -21,7 +19,7 @@ export function createTask(input: {
     config: clone(input.config), intent: "ready",
     price: { mode: "auto", manualValue: null }, seats: [],
     manifestKnown: input.manifestKnown, content: {}, completed: {}, sellers: {}, pools: {}, requests: {},
-    wallet: { revision: -1, available: "0", reflectedCommands: [] }, spent: "0", actualSamples: [], seenEvents: {},
+    wallet: { revision: -1, available: "0", reflectedCommands: [] }, spent: "0", seenEvents: {},
   };
   addContent(state, input.content, input.reused);
   return state;
@@ -51,17 +49,19 @@ export function restoreTask(snapshot: State): State {
     if (typeof seller.blacklisted !== "boolean") throw new Error("Invalid blacklist flag");
     if (seller.failureCount !== undefined) integer(seller.failureCount, 0);
     seller.failureCount ??= 0;
-    if (seller.zeroSpeedAt !== undefined && seller.zeroSpeedAt !== null) integer(seller.zeroSpeedAt, 0);
-    for (const sample of seller.samples) {
-      integer(sample.start); integer(sample.end, sample.start + 1); integer(sample.bytes, 1);
-      if (sample.end > s.now) throw new Error("Future speed sample");
-    }
+    seller.bytesTotal ??= 0; seller.timeMsTotal ??= 0;
+    integer(seller.bytesTotal, 0); integer(seller.timeMsTotal, 0);
+    seller.measured ??= false;
+    if (typeof seller.measured !== "boolean") throw new Error("Invalid measured flag");
+    if (seller.measured && seller.timeMsTotal <= 0) throw new Error("Measured seller without recorded time");
+    if (seller.lastAt === undefined) seller.lastAt = null;
+    if (seller.lastAt !== null) integer(seller.lastAt, 0);
   }
   for (const p of Object.values(s.pools)) {
     if (p.taskId !== s.taskId) throw new Error("Cross-task pool snapshot");
     validateQuote(p.quote); validateFees(p.fees);
     if (!s.sellers[p.sellerId] || p.quote.sellerId !== p.sellerId) throw new Error("Missing pool seller");
-    if (!["opening", "open", "closing", "closed", "failed", "recovery"].includes(p.funding)) throw new Error("Invalid funding state");
+    if (!["opening", "open", "closing", "closed", "failed", "problem"].includes(p.funding)) throw new Error("Invalid funding state");
     integer(p.blockCapacity); integer(p.purchasedBlocks);
     if (p.purchasedBlocks > p.blockCapacity) throw new Error("Pool block capacity exceeded");
     sats(p.amount); sats(p.committed);
@@ -85,7 +85,8 @@ function nextId(s: State, kind: string) { return `${s.taskId}/${kind}/${++s.sequ
 function base(s: State, reason: string) {
   return { commandId: nextId(s, "command"), taskId: s.taskId, revision: s.revision, reason };
 }
-function live(p: Pool) { return !["closed", "failed"].includes(p.funding); }
+/** 任务调度内的存活池：已关闭、已失败和问题池都不再参与。 */
+function live(p: Pool) { return !["closed", "failed", "problem"].includes(p.funding); }
 function active(p: Pool) { return p.scheduling !== "draining" && p.scheduling !== "retired"; }
 function drain(s: State, p: Pool, commands: Command[], reason: string) {
   if (p.scheduling === "draining" || p.scheduling === "retired") return;
@@ -115,7 +116,7 @@ function hasInFlight(s: State, sellerId: string): boolean {
   });
 }
 
-/** 席位优劣（前面的优先保留）：有在途责任者 → 有档案者 → 速度更快者 → 稳定 ID。 */
+/** 席位优劣（前面的优先保留）：有在途责任者 → 有测速档案者 → 速度更快者 → 稳定 ID。 */
 function bestSeatFirst(s: State) {
   return (a: string, b: string) =>
     Number(hasInFlight(s, b)) - Number(hasInFlight(s, a))
@@ -127,9 +128,9 @@ function bestSeatFirst(s: State) {
 /**
  * 席位评审：只在费用池"下载完成并进入 drain"的那一刻发生。
  * 只评审**本轮刚进入 drain** 的卖家（显式传入），不拿历史 draining 池重复评审。
- * 排名集合 = 在席且有有效速度档案的卖家（在途者只参与算名次）。
+ * 排名集合 = 在席且已测速的卖家（在途者只参与算名次）。
  * 名次 ≤ 基础名额 → 保留；名次 > 基础名额 → 一换一：
- *   a. 闲置有档案卖家里最快且比它快 → 替换；
+ *   a. 闲置已测速卖家里最快且比它快 → 替换；
  *   b. 否则有未测速闲置且浮动位未满 → 随机挑一名替换；
  *   c. 否则不换，续约。
  */
@@ -159,17 +160,12 @@ function reviewSeats(s: State, drained: Set<string>, desired: Set<string>, quali
 function plan(s: State): Command[] {
   const commands: Command[] = [];
   for (const r of Object.values(s.requests)) {
-    if (r.state === "pending" && s.now >= r.lastProgressAt + s.config.requestTimeoutMs) {
-      r.state = "unresolved";
-      const p = s.pools[r.poolId]; p.funding = "recovery"; p.recoveryAt = s.now;
-      // 全程零进度就超时属于网络问题：记零速事实，不拉黑、也不当作无档案新人。
-      if (r.transferredBytes === 0) s.sellers[p.sellerId].zeroSpeedAt = s.now;
-    }
-  }
-  for (const p of Object.values(s.pools)) if (p.funding === "recovery" && p.recoveryAt <= s.now) {
-    const command: Command = { ...base(s, "unknown-execution-result"), type: "reconcile", poolId: p.id, requestId: p.requestId };
-    p.recoveryCommandId = command.commandId; p.recoveryAt = s.now + s.config.recoveryRetryMs;
-    commands.push(command);
+    if (r.state !== "pending" || s.now < r.lastProgressAt + s.config.requestTimeoutMs) continue;
+    // 停摆是网络错误：请求结束、卖家按零字节记一次尝试（已测、不拉黑），池走正常关池回收。
+    const p = s.pools[r.poolId];
+    r.state = "rejected"; p.requestId = null;
+    recordFailedAttempt(s.sellers[p.sellerId], r.transferredBytes, r.startedAt, s.now);
+    drain(s, p, commands, "request-timeout");
   }
   const rec = recommendations(s);
   const complete = s.manifestKnown && pendingContent(s).length === 0;
@@ -183,7 +179,7 @@ function plan(s: State): Command[] {
   const desired = new Set<string>();
   for (const id of s.seats) if (qualifiedIds.has(id)) desired.add(id);
 
-  // 席位收缩：限额变小、或档案过期使无档案在席卖家超限时，让超额席位退出。
+  // 席位收缩：限额变小、或出现未测速在席卖家超限时，让超额席位退出。
   // 退出只做 drain：停止分配新块，已确认付款与在途责任照常完成。
   const trimmed = new Set<string>();
   {
@@ -252,13 +248,12 @@ function plan(s: State): Command[] {
     if (p.funding !== "open" || p.requestId) continue;
     if (p.scheduling === "draining") {
       const command: Command = { ...base(s, p.drainReason ?? "drain-complete"), type: "close", poolId: p.id, committed: p.committed };
-      p.funding = "closing"; p.closeCommandId = command.commandId;
-      p.recoveryAt = s.now + s.config.requestTimeoutMs; commands.push(command);
+      p.funding = "closing"; p.closeCommandId = command.commandId; commands.push(command);
     }
   }
 
   if (enabled && !awaitingManifest) {
-    // 补席位：有档案者按速度降序优先；无档案者随机补浮动位。
+    // 补席位：有档案者按速度降序优先；未测速者随机补浮动位。
     const cap = seatCap(s);
     if (desired.size < cap) {
       const measuredIdle = qualified.filter(q => !desired.has(q.sellerId) && !trimmed.has(q.sellerId) && hasArchive(s, q.sellerId))
@@ -304,8 +299,8 @@ function plan(s: State): Command[] {
         quote: clone(q), fees: clone(q.fees), amount: command.amount, committed: "0", blockCapacity: count, purchasedBlocks: 0,
         funding: "opening", scheduling: "idle", openCommandId: command.commandId,
         closeCommandId: null, requestId: null, drainReason: null, returned: null,
-        refundAvailable: false, openingObserved: false, recoveryAt: s.now + s.config.requestTimeoutMs,
-        recoveryCommandId: null, walletRevisionAtIntent: s.wallet.revision,
+        refundAvailable: false, openingObserved: false,
+        walletRevisionAtIntent: s.wallet.revision,
       };
       commands.push(command);
     }
@@ -318,13 +313,8 @@ function nextWakeAt(s: State): number | null {
   const times: number[] = [];
   for (const seller of Object.values(s.sellers)) {
     if (seller.quote && seller.quote.expiresAt > s.now) times.push(seller.quote.expiresAt);
-    if (seller.blockedUntil > s.now) times.push(seller.blockedUntil);
-    const sample = seller.samples.at(-1);
-    if (sample && sample.end + s.config.sampleMaxAgeMs + 1 > s.now) times.push(sample.end + s.config.sampleMaxAgeMs + 1);
-    if (seller.zeroSpeedAt !== null && seller.zeroSpeedAt + s.config.sampleMaxAgeMs + 1 > s.now) times.push(seller.zeroSpeedAt + s.config.sampleMaxAgeMs + 1);
   }
   for (const p of Object.values(s.pools)) {
-    if ((p.funding === "opening" || p.funding === "closing" || p.funding === "recovery") && p.recoveryAt > s.now) times.push(p.recoveryAt);
     if (p.requestId) {
       const r = s.requests[p.requestId];
       if (r.state === "pending") times.push(r.lastProgressAt + s.config.requestTimeoutMs);
@@ -344,7 +334,6 @@ export function step(previous: State, event: Event): Result {
   const s = clone(previous);
   s.now = event.receivedAt; s.revision++; s.seenEvents[event.eventId] = true;
   reduce(s, event);
-  for (const p of Object.values(s.pools)) if (["opening", "closing"].includes(p.funding) && p.recoveryAt <= s.now) p.funding = "recovery";
   const commands = plan(s);
   return { state: s, commands, view: view(s), nextWakeAt: nextWakeAt(s) };
 }

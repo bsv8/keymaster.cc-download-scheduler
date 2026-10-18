@@ -1,4 +1,4 @@
-import { price, rate, sats } from "./math.js";
+import { price, sats } from "./math.js";
 import type { Quote, SliderView, State, View } from "./types.js";
 
 export function pendingContent(s: State) {
@@ -9,26 +9,21 @@ export function availableContent(s: State, q: Quote) {
     && (c.kind === "seed" || !Object.values(s.content).some(x => x.kind === "seed" && !s.completed[x.id])));
 }
 /**
- * 卖家速度事实：
- * - 有窗口内样本 → 实测速率；
- * - 无样本但窗口内有"全程零进度"记录 → 0（参与名次、排最后，且不算无档案新人）；
- * - 其余 → null（无档案）。
+ * 卖家速度事实：累计已验收交付的块字节 ÷ 累计传输耗时。
+ * 长期保留、没有窗口、没有过期；未测速返回 null；测过但零字节返回 0，二者分开。
  */
 export function sellerSpeed(s: State, sellerId: string): number | null {
   const seller = s.sellers[sellerId];
-  if (!seller) return null;
-  const measured = rate(seller.samples, s.now, s.config.sampleWindowMs, s.config.sampleMaxAgeMs);
-  if (measured !== null) return measured;
-  if (seller.zeroSpeedAt !== null && s.now - seller.zeroSpeedAt <= s.config.sampleMaxAgeMs) return 0;
-  return null;
+  if (!seller || !seller.measured) return null;
+  return seller.timeMsTotal > 0 ? seller.bytesTotal * 1000 / seller.timeMsTotal : 0;
 }
-/** 是否有有效速度档案（含零速记录）。 */
+/** 是否测过速（含零字节的完整尝试）。 */
 export function hasArchive(s: State, sellerId: string): boolean {
-  return sellerSpeed(s, sellerId) !== null;
+  return s.sellers[sellerId]?.measured === true;
 }
-/** 宿主/UI 判断该卖家是否还没有有效速度档案（内核不再据此改变派发块数）。 */
+/** 宿主/UI 判断该卖家是否还没有测过速。 */
 export function needsProbe(s: State, sellerId: string): boolean {
-  return (sellerSpeed(s, sellerId) ?? 0) === 0;
+  return !hasArchive(s, sellerId);
 }
 /** 任务有效价格上限：手动值优先，否则使用系统缺省值。系统缺省不是授权上限。 */
 export function effectivePrice(s: State): bigint {
@@ -39,15 +34,15 @@ export function effectivePrice(s: State): bigint {
 export function seatCap(s: State): number {
   return s.config.baseSeats + s.config.floatingSeats;
 }
-/** 在席且无有效速度档案的卖家上限（浮动位限位）。 */
+/** 在席且未测速的卖家上限（浮动位限位）。 */
 export function unmeasuredCap(s: State): number {
   return s.config.floatingSeats;
 }
 /** 市场有效报价：排除黑名单与失去资格的卖家；是否在价格上限内由调用方过滤。 */
 export function validQuotes(s: State): Quote[] {
-  return Object.values(s.sellers).filter(x => x.online && !x.blacklisted && x.blockedUntil <= s.now).flatMap(seller => {
+  return Object.values(s.sellers).filter(x => x.online && !x.blacklisted).flatMap(seller => {
     const pool = Object.values(s.pools).find(p => p.sellerId === seller.id
-      && ["open", "opening"].includes(p.funding) && p.scheduling !== "draining");
+      && ["open", "opening"].includes(p.funding) && p.scheduling !== "draining" && p.scheduling !== "retired");
     const q = pool?.quote ?? seller.quote;
     return q && (pool || q.expiresAt > s.now) && availableContent(s, q).length ? [q] : [];
   });
@@ -59,9 +54,10 @@ export function candidates(s: State, ceiling: bigint): Quote[] {
 export const byPrice = (a: Quote, b: Quote) => sats(a.blockPrice) < sats(b.blockPrice) ? -1
   : sats(a.blockPrice) > sats(b.blockPrice) ? 1 : a.sellerId.localeCompare(b.sellerId);
 
+/** 一组卖家的累计速度合计；没有接收带宽上限参数，只做事实求和。 */
 export function totalSpeed(s: State, quotes: Quote[]): number {
   const values = [...new Set(quotes.map(q => q.sellerId))].map(id => sellerSpeed(s, id) ?? 0);
-  return Math.min(values.reduce((a, b) => a + b, 0), s.config.receiveBytesPerSecond ?? Infinity);
+  return values.reduce((a, b) => a + b, 0);
 }
 
 /** 价格杆视图：v1 没有自动建议，只有系统缺省值与用户手动值。 */
@@ -81,14 +77,15 @@ export function recommendations(s: State): { price: SliderView; quotes: Quote[];
 export function view(s: State): View {
   const rec = recommendations(s);
   const pools = Object.values(s.pools);
-  const live = pools.filter(p => !["closed", "failed"].includes(p.funding));
+  const live = pools.filter(p => !["closed", "failed", "problem"].includes(p.funding));
+  const problem = pools.filter(p => p.funding === "problem");
   const complete = s.manifestKnown && pendingContent(s).length === 0;
   const requests = Object.values(s.requests).filter(r => r.state === "pending" || r.state === "unresolved");
-  const active = live.filter(p => p.funding === "open" && p.scheduling !== "draining");
-  const sustainable = totalSpeed(s, active.map(p => p.quote));
+  const serving = live.filter(p => p.funding === "open" && p.requestId && p.scheduling === "serving");
+  const active = live.filter(p => p.funding === "open" && p.scheduling !== "draining" && p.scheduling !== "retired");
   const reasons: string[] = [];
   if (!s.manifestKnown) reasons.push("manifest-unknown");
-  if (live.some(p => p.funding === "recovery")) reasons.push("recovery-required");
+  if (problem.length) reasons.push("problem-pool");
   if (!rec.quotes.length && !complete) reasons.push("no-eligible-seller");
   if (rec.quotes.some(q => sellerSpeed(s, q.sellerId) === null)) reasons.push("speed-unmeasured");
   if (s.price.mode === "manual" && Object.values(s.sellers).some(x => x.online && !x.blacklisted && x.quote
@@ -98,9 +95,6 @@ export function view(s: State): View {
     else if (live.some(p => p.funding === "closing" || p.scheduling === "draining")) reasons.push("settling");
     else reasons.push("awaiting-resources");
   }
-  const recent = s.actualSamples.filter(x => x.end > s.now - s.config.sampleWindowMs);
-  const start = Math.max(s.now - s.config.sampleWindowMs, Math.min(s.now, ...recent.map(x => x.start)));
-  const bytes = recent.reduce((n, x) => n + x.bytes * (x.end - Math.max(start, x.start)) / (x.end - x.start), 0);
   let costMin = 0n, costMax = 0n, covered = true;
   for (const item of pendingContent(s)) {
     const request = Object.values(s.requests).find(r => ["pending", "unresolved"].includes(r.state) && r.contentIds.includes(item.id));
@@ -125,16 +119,16 @@ export function view(s: State): View {
       : s.intent === "pause" ? (requests.length ? "stopping" : "paused")
       : requests.length ? "running" : "waiting",
     content: !s.manifestKnown ? "manifest-unknown" : complete ? "complete" : "incomplete",
-    funds: live.some(p => p.funding === "recovery") ? "recovery-required"
+    funds: problem.length ? "problem"
       : live.length || pools.some(p => p.funding === "closed" && !p.refundAvailable) ? "pending"
       : pools.length ? "settled" : "none",
     price: rec.price,
     sellerSpeeds: Object.fromEntries(Object.values(s.sellers).map(x => [x.id, {
-      bytesPerSecond: sellerSpeed(s, x.id), samples: x.samples.length, lastAt: x.samples.at(-1)?.end ?? null,
-      zeroSpeed: sellerSpeed(s, x.id) === 0,
+      bytesPerSecond: sellerSpeed(s, x.id), measured: x.measured,
+      bytesTotal: x.bytesTotal, timeMsTotal: x.timeMsTotal, lastAt: x.lastAt,
     }])),
-    actualBytesPerSecond: s.now > start ? bytes * 1000 / (s.now - start) : 0,
-    sustainableBytesPerSecond: sustainable,
+    actualBytesPerSecond: totalSpeed(s, serving.map(p => p.quote)),
+    sustainableBytesPerSecond: totalSpeed(s, active.map(p => p.quote)),
     facts: {
       eligible: eligibleIds.size, aboveCeiling, measured,
       unmeasuredEligible, zeroSpeed, blacklisted, inFlight: requests.length,

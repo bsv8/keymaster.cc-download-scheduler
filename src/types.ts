@@ -22,35 +22,34 @@ export interface Config {
   maxBlockPrice: Sats;
   /** 在席卖家数上限的基础名额。 */
   baseSeats: number;
-  /** 浮动位：在席且没有有效速度档案的卖家不超过该数量。 */
+  /** 浮动位：在席且没有速度档案的卖家不超过该数量。 */
   floatingSeats: number;
   /** 一个费用池 = 一批 = 一次请求的块数上限，同时是派发粒度。 */
   poolBlocks: number;
-  sampleWindowMs: number;
-  sampleMaxAgeMs: number;
+  /** 请求停摆超时：连续这么久没有新字节就判停摆，不是整批总时长。 */
   requestTimeoutMs: number;
-  recoveryRetryMs: number;
-  retryMs: number;
-  /** 合同费用由外围计算，这些参数使用外部提供的估算值。 */
-  /** 可选的已知接收端共享带宽上限，不代表对未知链路的保证。 */
-  receiveBytesPerSecond?: number;
 }
 export interface Slider {
   mode: "auto" | "manual";
   manualValue: string | null;
 }
-export interface Sample { start: number; end: number; bytes: number }
 export interface Seller {
   id: string; online: boolean; quote: Quote | null;
-  samples: Sample[]; blockedUntil: number;
+  /** 累计已验收交付的块字节；有尝试无字节只累计时间。 */
+  bytesTotal: number;
+  /** 累计传输耗时（毫秒）：成功交付用交付墙钟，失败尝试按请求时长累计。 */
+  timeMsTotal: number;
+  /** 是否测过速：发生过交付或一次完整尝试（含停摆）即为 true。 */
+  measured: boolean;
+  /** 最近一次交付或失败尝试结束的时刻。 */
+  lastAt: number | null;
   /** 确定失败立即拉黑本任务，永不再选；优先于"重新报价可回归"。 */
   blacklisted: boolean;
   /** 确定失败累计次数，供审计与展示。 */
   failureCount: number;
-  /** 最近一次"全程零进度"的时间；窗口内按 0 速参与名次，不算"无档案新人"。 */
-  zeroSpeedAt: number | null;
 }
-export type PoolFunding = "opening" | "open" | "closing" | "closed" | "failed" | "recovery";
+/** 池资金状态；`problem` 表示结果未知或资金待清理，已移出任务调度，由宿主记录并事后处理。 */
+export type PoolFunding = "opening" | "open" | "closing" | "closed" | "failed" | "problem";
 export interface Pool {
   id: string; taskId: string; sellerId: string; sessionId: string;
   quote: Quote; fees: Fees; amount: Sats; committed: Sats; blockCapacity: number; purchasedBlocks: number;
@@ -58,7 +57,6 @@ export interface Pool {
   openCommandId: string; closeCommandId: string | null;
   requestId: string | null; drainReason: string | null;
   returned: Sats | null; refundAvailable: boolean; openingObserved: boolean;
-  recoveryAt: number; recoveryCommandId: string | null;
   /** 责任持续占用，直到明确的执行结果允许释放。 */
   walletRevisionAtIntent: number;
 }
@@ -77,11 +75,11 @@ export interface State {
   completed: Record<string, "reused" | "purchased">;
   sellers: Record<string, Seller>; pools: Record<string, Pool>; requests: Record<string, Request>;
   wallet: { revision: number; available: Sats; reflectedCommands: string[] };
-  spent: Sats; actualSamples: Sample[]; seenEvents: Record<string, true>;
+  spent: Sats; seenEvents: Record<string, true>;
 }
 export type Payload =
   | { type: "start" | "pause" | "resume" | "cancel" | "tick" }
-  | { type: "limits"; maxBlockPrice?: Sats; baseSeats?: number; floatingSeats?: number; receiveBytesPerSecond?: number }
+  | { type: "limits"; maxBlockPrice?: Sats; baseSeats?: number; floatingSeats?: number }
   | { type: "slider"; slider: "price"; value: string }
   | { type: "automatic"; slider: "price" }
   | { type: "manifest"; content: Content[]; reused?: string[] }
@@ -97,8 +95,7 @@ export type Payload =
   | { type: "delivery"; requestId: string; accepted: string[]; paid: Sats; startedAt: number; endedAt: number }
   | { type: "request-rejected"; requestId: string; safeToRetry: boolean }
   | { type: "closed"; poolId: string; commandId: string; returned: Sats; spent: Sats }
-  | { type: "refund-available"; poolId: string }
-  | { type: "reconciled"; poolId: string; commandId: string; outcome: "close-rejected" | "opening-failed" };
+  | { type: "refund-available"; poolId: string };
 export type Event = Payload & {
   eventId: string; taskId: string; occurredAt: number; receivedAt: number;
 };
@@ -112,7 +109,6 @@ export type Command = CommandBase & (
       prices: Record<string, Sats>; maxPayment: Sats; priceLimit: Sats; feeVersion: number }
   | { type: "drain"; poolId: string }
   | { type: "close"; poolId: string; committed: Sats }
-  | { type: "reconcile"; poolId: string; requestId: string | null }
 );
 export interface SliderView {
   mode: "auto" | "manual"; manualValue: string | null;
@@ -121,13 +117,21 @@ export interface SliderView {
   /** 市场已报价区间，只作事实展示。 */
   range: { min: string; max: string } | null;
 }
+export interface SellerSpeedView {
+  /** 累计速度：总字节 ÷ 总时间；未测速为 null，测过但零字节为 0。 */
+  bytesPerSecond: number | null;
+  measured: boolean;
+  bytesTotal: number;
+  timeMsTotal: number;
+  lastAt: number | null;
+}
 export interface View {
   taskId: string; revision: number;
   execution: "ready" | "running" | "waiting" | "paused" | "stopping" | "stopped" | "finished";
   content: "manifest-unknown" | "incomplete" | "complete";
-  funds: "none" | "pending" | "settled" | "recovery-required";
+  funds: "none" | "pending" | "settled" | "problem";
   price: SliderView;
-  sellerSpeeds: Record<string, { bytesPerSecond: number | null; samples: number; lastAt: number | null; zeroSpeed: boolean }>;
+  sellerSpeeds: Record<string, SellerSpeedView>;
   actualBytesPerSecond: number; sustainableBytesPerSecond: number;
   /** 只陈述事实的准入与在途统计，不做任何无数据来源的预测。 */
   facts: {

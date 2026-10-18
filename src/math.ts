@@ -1,4 +1,4 @@
-import type { Content, Fees, Quote, Sats, Sample } from "./types.js";
+import type { Content, Fees, Quote, Sats } from "./types.js";
 
 export function sats(value: Sats): bigint {
   if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value)) throw new Error("Invalid integer sats");
@@ -32,17 +32,4 @@ export function validateQuote(q: Quote) {
   sats(q.blockPrice); sats(q.seedPrice);
   if (q.tailPrice !== undefined) sats(q.tailPrice);
   validateFees(q.fees);
-}
-/** 按窗口裁剪有效字节与耗时，不对不同块速率做无权平均。 */
-export function rate(samples: Sample[], now: number, window: number, maxAge: number): number | null {
-  const recent = samples.filter(s => s.end > now - window && s.end <= now);
-  if (!recent.length || now - recent[recent.length - 1].end > maxAge) return null;
-  let bytes = 0, time = 0;
-  for (const s of recent) {
-    const duration = s.end - s.start;
-    const overlap = s.end - Math.max(s.start, now - window);
-    bytes += s.bytes * overlap / duration;
-    time += overlap;
-  }
-  return time > 0 ? bytes * 1000 / time : null;
 }

@@ -1,5 +1,19 @@
 import { identity, integer, price, sats, validateFees, validateQuote } from "./math.js";
-import type { Content, Event, State } from "./types.js";
+import type { Content, Event, Seller, State } from "./types.js";
+
+function ensureSeller(s: State, id: string, online: boolean): Seller {
+  return s.sellers[id] ??= {
+    id, online, quote: null, bytesTotal: 0, timeMsTotal: 0,
+    measured: false, lastAt: null, blacklisted: false, failureCount: 0,
+  };
+}
+
+/** 记录一次失败尝试的已传字节与耗时：零字节尝试保持 0 速，与未测速分开。 */
+export function recordFailedAttempt(seller: Seller, bytes: number, startedAt: number, at: number) {
+  seller.bytesTotal += bytes;
+  seller.timeMsTotal += Math.max(1, at - startedAt);
+  seller.measured = true; seller.lastAt = at;
+}
 
 export function addContent(s: State, content: Content[], reused: string[] = []) {
   for (const c of content) {
@@ -28,7 +42,6 @@ export function reduce(s: State, e: Event) {
       if (e.maxBlockPrice !== undefined) { sats(e.maxBlockPrice); s.config.maxBlockPrice = e.maxBlockPrice; }
       if (e.baseSeats !== undefined) { integer(e.baseSeats, 1); s.config.baseSeats = e.baseSeats; }
       if (e.floatingSeats !== undefined) { integer(e.floatingSeats, 1); s.config.floatingSeats = e.floatingSeats; }
-      if (e.receiveBytesPerSecond !== undefined) { integer(e.receiveBytesPerSecond, 1); s.config.receiveBytesPerSecond = e.receiveBytesPerSecond; }
       break;
     case "slider":
       sats(e.value);
@@ -41,14 +54,13 @@ export function reduce(s: State, e: Event) {
     case "quote": {
       validateQuote(e.quote);
       const q = e.quote;
-      const seller = s.sellers[q.sellerId] ??= { id: q.sellerId, online: true, quote: null, samples: [], blockedUntil: 0, blacklisted: false, failureCount: 0, zeroSpeedAt: null };
+      const seller = ensureSeller(s, q.sellerId, true);
       if (!seller.quote || q.version > seller.quote.version) seller.quote = { ...q };
       break;
     }
     case "seller": {
       identity(e.sellerId);
-      const seller = s.sellers[e.sellerId] ??= { id: e.sellerId, online: false, quote: null, samples: [], blockedUntil: 0, blacklisted: false, failureCount: 0, zeroSpeedAt: null };
-      seller.online = e.online; break;
+      ensureSeller(s, e.sellerId, false).online = e.online; break;
     }
     case "wallet":
       integer(e.revision); sats(e.available);
@@ -65,18 +77,19 @@ export function reduce(s: State, e: Event) {
       const p = s.pools[e.poolId];
       if (!p || p.openCommandId !== e.commandId) throw new Error("Uncorrelated opening");
       if (p.openingObserved) break;
-      if (!["opening", "recovery"].includes(p.funding)) break;
-      p.funding = "open"; p.recoveryCommandId = null;
-      if (!p.openingObserved) s.spent = String(sats(s.spent) + sats(p.quote.fees.opening));
-      p.openingObserved = true; break;
+      if (!["opening", "problem"].includes(p.funding)) break;
+      p.openingObserved = true;
+      s.spent = String(sats(s.spent) + sats(p.quote.fees.opening));
+      // 晚到的可信事实照常记录；problem 池不因此回到调度。
+      if (p.funding === "opening") p.funding = "open";
+      break;
     }
     case "open-failed": {
       const p = s.pools[e.poolId];
       if (!p || p.openCommandId !== e.commandId) throw new Error("Uncorrelated failure");
-      if (p.openingObserved || !["opening", "recovery"].includes(p.funding)) break;
-      p.funding = e.released ? "failed" : "recovery";
-      p.recoveryAt = s.now;
-      s.sellers[p.sellerId].blockedUntil = s.now + s.config.retryMs; break;
+      if (p.openingObserved || !["opening", "problem"].includes(p.funding)) break;
+      p.funding = e.released ? "failed" : "problem";
+      p.scheduling = "retired"; break;
     }
     case "unknown": {
       const p = s.pools[e.poolId];
@@ -85,8 +98,11 @@ export function reduce(s: State, e: Event) {
       if (request && ["settled", "rejected"].includes(request.state)) break;
       if (e.commandId === p.openCommandId && p.openingObserved) break;
       if (![p.openCommandId, p.closeCommandId, request?.commandId].includes(e.commandId)) throw new Error("Uncorrelated unknown result");
-      if (["closed", "failed"].includes(p.funding)) break;
-      p.funding = "recovery"; p.recoveryAt = s.now; p.recoveryCommandId = null; break;
+      if (["closed", "failed", "problem"].includes(p.funding)) break;
+      // 结果未知就是错误：池移出调度进问题池，等事后清理，不自动查链、不自动重试。
+      if (request) request.state = "unresolved";
+      p.funding = "problem"; p.scheduling = "retired";
+      break;
     }
     case "progress": {
       identity(e.requestId);
@@ -102,44 +118,46 @@ export function reduce(s: State, e: Event) {
       identity(e.requestId);
       const r = s.requests[e.requestId];
       if (!r) throw new Error("Unknown delivery request");
-      if (["settled", "rejected"].includes(r.state)) break;
+      if (r.state === "settled") break;
+      const p = s.pools[r.poolId];
+      if (["closed", "failed"].includes(p.funding)) throw new Error("Delivery after pool settlement");
       integer(e.startedAt); integer(e.endedAt, e.startedAt + 1);
       if (e.endedAt > s.now) throw new Error("Future delivery");
       if (new Set(e.accepted).size !== e.accepted.length || e.accepted.some(id => !r.contentIds.includes(id))) throw new Error("Invalid accepted content");
       const expected = e.accepted.reduce((n, id) => n + sats(r.prices[id]), 0n);
       if (sats(e.paid) !== expected) throw new Error("Payment differs from authorization");
-      const p = s.pools[r.poolId];
       if (sats(p.committed) + expected > sats(p.amount)) throw new Error("Pool overspend");
       p.committed = String(sats(p.committed) + expected);
       p.purchasedBlocks += e.accepted.filter(id => s.content[id].kind === "block").length;
       s.spent = String(sats(s.spent) + expected);
       r.state = "settled"; p.requestId = null;
       for (const id of e.accepted) s.completed[id] = "purchased";
-      // 确定失败：验收为空（坏块 / 内容校验失败）→ 本任务立即拉黑该卖家。
-      if (!e.accepted.length) { s.sellers[p.sellerId].blacklisted = true; s.sellers[p.sellerId].failureCount++; }
-      else s.sellers[p.sellerId].zeroSpeedAt = null;
+      const seller = s.sellers[p.sellerId];
       const bytes = e.accepted.filter(id => s.content[id].kind === "block").reduce((n, id) => n + s.content[id].bytes, 0);
-      if (bytes) {
-        const sample = { bytes, start: e.startedAt, end: e.endedAt };
-        s.sellers[p.sellerId].samples.push(sample); s.actualSamples.push(sample);
+      if (!e.accepted.length) {
+        // 确定失败：验收为空（坏块 / 内容校验失败）→ 本任务立即拉黑该卖家。
+        seller.blacklisted = true; seller.failureCount++;
+        recordFailedAttempt(seller, 0, e.startedAt, e.endedAt);
+      } else if (bytes > 0) {
+        // 累计口径：只统计已验收交付的块字节与墙钟耗时。
+        seller.bytesTotal += bytes;
+        seller.timeMsTotal += e.endedAt - e.startedAt;
+        seller.measured = true; seller.lastAt = e.endedAt;
       }
-      if (p.funding === "recovery") { p.funding = "open"; p.recoveryCommandId = null; }
-      if (p.scheduling !== "draining") p.scheduling = "serving";
+      if (p.funding === "open" && p.scheduling !== "draining" && p.scheduling !== "retired") p.scheduling = "serving";
       break;
     }
     case "request-rejected": {
       const r = s.requests[e.requestId];
       if (!r || !["pending", "unresolved"].includes(r.state)) break;
       const p = s.pools[r.poolId];
-      if (e.safeToRetry) {
-        r.state = "rejected"; p.requestId = null;
-        if (p.funding === "recovery") { p.funding = "open"; p.recoveryCommandId = null; }
-        p.scheduling = "draining"; p.drainReason = "request-rejected";
-        s.sellers[p.sellerId].blockedUntil = s.now + s.config.retryMs;
-      }
-      else { r.state = "unresolved"; p.funding = "recovery"; p.recoveryAt = s.now;
+      r.state = "rejected"; p.requestId = null;
+      if (!e.safeToRetry) {
         // 不可重试的拒绝是确定失败：本任务立即拉黑该卖家。
-        s.sellers[p.sellerId].blacklisted = true; s.sellers[p.sellerId].failureCount++; }
+        const seller = s.sellers[p.sellerId];
+        seller.blacklisted = true; seller.failureCount++;
+      }
+      if (p.scheduling !== "retired") { p.scheduling = "draining"; p.drainReason = "request-rejected"; }
       break;
     }
     case "closed": {
@@ -155,26 +173,8 @@ export function reduce(s: State, e: Event) {
       if (!p || p.funding !== "closed") throw new Error("Refund before close observation");
       p.refundAvailable = true; break;
     }
-    case "reconciled": {
-      if (!["close-rejected", "opening-failed"].includes(e.outcome)) throw new Error("Invalid reconciliation outcome");
-      const p = s.pools[e.poolId];
-      if (!p || p.recoveryCommandId !== e.commandId) throw new Error("Uncorrelated reconciliation");
-      if (p.requestId || p.funding !== "recovery") break;
-      if (e.outcome === "opening-failed") {
-        if (p.openingObserved) throw new Error("Observed opening cannot be erased");
-        p.funding = "failed"; s.sellers[p.sellerId].blockedUntil = s.now + s.config.retryMs;
-      } else {
-        // 开池确认必须通过 `opened` 输入，保证开池费只记一次。
-        if (!p.closeCommandId) throw new Error("Use opened result to resolve uncertain opening");
-        p.funding = "open"; p.closeCommandId = null;
-      }
-      p.recoveryCommandId = null; break;
-    }
     default: throw new Error("Unknown scheduler event");
   }
-  // 按配置时间窗口清理速度样本，保留请求和付款的持久化去重记录。
-  for (const seller of Object.values(s.sellers)) seller.samples = seller.samples.filter(x => x.end > s.now - s.config.sampleWindowMs);
-  s.actualSamples = s.actualSamples.filter(x => x.end > s.now - s.config.sampleWindowMs);
 }
 
 export function assertRequestPrices(s: State) {
