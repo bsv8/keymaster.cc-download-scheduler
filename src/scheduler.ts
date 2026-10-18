@@ -309,7 +309,7 @@ function plan(s: State): Command[] {
   return commands;
 }
 
-function nextWakeAt(s: State): number | null {
+export function nextWakeAt(s: State): number | null {
   const times: number[] = [];
   for (const seller of Object.values(s.sellers)) {
     if (seller.quote && seller.quote.expiresAt > s.now) times.push(seller.quote.expiresAt);
