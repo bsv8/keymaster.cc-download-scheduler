@@ -54,7 +54,7 @@ export type PoolFunding = "opening" | "open" | "closing" | "closed" | "failed" |
 export interface Pool {
   id: string; taskId: string; sellerId: string; sessionId: string;
   quote: Quote; fees: Fees; amount: Sats; committed: Sats; blockCapacity: number; purchasedBlocks: number;
-  funding: PoolFunding; scheduling: "idle" | "probing" | "serving" | "draining" | "retired";
+  funding: PoolFunding; scheduling: "idle" | "serving" | "draining" | "retired";
   openCommandId: string; closeCommandId: string | null;
   requestId: string | null; drainReason: string | null;
   returned: Sats | null; refundAvailable: boolean; openingObserved: boolean;

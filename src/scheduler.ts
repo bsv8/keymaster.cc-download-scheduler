@@ -1,4 +1,4 @@
-import { availableContent, hasArchive, needsProbe, pendingContent, recommendations, seatCap, sellerSpeed, unmeasuredCap, view } from "./recommend.js";
+import { availableContent, hasArchive, pendingContent, recommendations, seatCap, sellerSpeed, unmeasuredCap, view } from "./recommend.js";
 import { identity, integer, price, reserve, sats, validateFees, validateQuote } from "./math.js";
 import { addContent, assertRequestPrices, reduce } from "./reducer.js";
 import type { Command, Config, Content, Event, Pool, Quote, Result, State } from "./types.js";
@@ -208,13 +208,11 @@ function plan(s: State): Command[] {
     // 锁价合同可以在原报价过期后继续使用；新请求仍受当前有效价格上限约束。
     if (sats(p.quote.blockPrice) > rec.effective) continue;
     let items = availableContent(s, p.quote).filter(c => !claimed.has(c.id));
-    const probe = needsProbe(s, p.sellerId);
     if (items.length) {
       const seedFirst = items[0].kind === "seed";
       const remaining = Math.max(0, p.blockCapacity - p.purchasedBlocks);
-      // 探速只派一个真实块，但同样受池块容量约束，不能越过 purchasedBlocks ≤ blockCapacity。
-      const limit = seedFirst ? 1 : probe ? Math.min(1, remaining) : remaining;
-      items = items.slice(0, limit);
+      // 一个池 = 一批 = 一次请求：首次也是正式下载，一次派满剩余容量（Seed 单条目先买）。
+      items = items.slice(0, seedFirst ? 1 : remaining);
     }
     while (items.length && items.reduce((n, c) => n + price(p.quote, c), 0n)
       + reserve(p.fees, items.length) > sats(p.amount) - sats(p.committed)) items.pop();
@@ -227,14 +225,14 @@ function plan(s: State): Command[] {
     }
     const requestId = nextId(s, "request");
     const prices = Object.fromEntries(items.map(c => [c.id, String(price(p.quote, c))]));
-    const command: Command = { ...base(s, probe || items[0].kind === "seed" ? "probe-real-content" : "continue"),
+    const command: Command = { ...base(s, items[0].kind === "seed" ? "seed-first" : "download"),
       type: "download", poolId: p.id, requestId, contentIds: items.map(c => c.id), prices,
       maxPayment: String(Object.values(prices).reduce((n, v) => n + sats(v), 0n)),
       priceLimit: String(rec.effective), feeVersion: p.fees.version };
     s.requests[requestId] = { id: requestId, commandId: command.commandId, poolId: p.id,
       contentIds: command.contentIds, prices, startedAt: s.now, lastProgressAt: s.now,
       transferredBytes: 0, state: "pending" };
-    p.requestId = requestId; p.scheduling = command.reason === "probe-real-content" ? "probing" : "serving";
+    p.requestId = requestId; p.scheduling = "serving";
     for (const c of items) claimed.add(c.id);
     commands.push(command);
   }

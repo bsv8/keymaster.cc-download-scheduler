@@ -26,7 +26,7 @@ export function sellerSpeed(s: State, sellerId: string): number | null {
 export function hasArchive(s: State, sellerId: string): boolean {
   return sellerSpeed(s, sellerId) !== null;
 }
-/** 是否需要先用一个真实块探速：无档案或当前档案为零速。 */
+/** 宿主/UI 判断该卖家是否还没有有效速度档案（内核不再据此改变派发块数）。 */
 export function needsProbe(s: State, sellerId: string): boolean {
   return (sellerSpeed(s, sellerId) ?? 0) === 0;
 }
