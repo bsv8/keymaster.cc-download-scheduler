@@ -107,19 +107,37 @@ function walletFree(s: State): bigint {
   return sorted[h % sorted.length];
 }
 
+/** 该卖家是否有未决在途请求：在途者只参与算名次，不被踢。 */
+function hasInFlight(s: State, sellerId: string): boolean {
+  return Object.values(s.pools).some(p => {
+    const r = p.requestId ? s.requests[p.requestId] : undefined;
+    return p.sellerId === sellerId && !!r && (r.state === "pending" || r.state === "unresolved");
+  });
+}
+
+/** 席位优劣（前面的优先保留）：有在途责任者 → 有档案者 → 速度更快者 → 稳定 ID。 */
+function bestSeatFirst(s: State) {
+  return (a: string, b: string) =>
+    Number(hasInFlight(s, b)) - Number(hasInFlight(s, a))
+    || Number(hasArchive(s, b)) - Number(hasArchive(s, a))
+    || (sellerSpeed(s, b) ?? 0) - (sellerSpeed(s, a) ?? 0)
+    || a.localeCompare(b);
+}
+
 /**
  * 席位评审：只在费用池"下载完成并进入 drain"的那一刻发生。
+ * 只评审**本轮刚进入 drain** 的卖家（显式传入），不拿历史 draining 池重复评审。
  * 排名集合 = 在席且有有效速度档案的卖家（在途者只参与算名次）。
  * 名次 ≤ 基础名额 → 保留；名次 > 基础名额 → 一换一：
  *   a. 闲置有档案卖家里最快且比它快 → 替换；
  *   b. 否则有未测速闲置且浮动位未满 → 随机挑一名替换；
  *   c. 否则不换，续约。
  */
-function reviewSeats(s: State, desired: Set<string>, qualified: Quote[]) {
-  const drainSellers = [...desired].filter(id =>
-    Object.values(s.pools).some(p => p.sellerId === id && live(p) && p.scheduling === "draining"));
-  for (const drainSeller of drainSellers) {
+function reviewSeats(s: State, drained: Set<string>, desired: Set<string>, qualified: Quote[]) {
+  for (const drainSeller of drained) {
     if (!desired.has(drainSeller) || !hasArchive(s, drainSeller)) continue;
+    // 在途责任优先：有未决请求的卖家不被替换。
+    if (hasInFlight(s, drainSeller)) continue;
     const ranked = [...desired].filter(id => hasArchive(s, id))
       .sort((a, b) => (sellerSpeed(s, b)! - sellerSpeed(s, a)!) || a.localeCompare(b));
     const rank = ranked.indexOf(drainSeller) + 1;
@@ -165,8 +183,23 @@ function plan(s: State): Command[] {
   const desired = new Set<string>();
   for (const id of s.seats) if (qualifiedIds.has(id)) desired.add(id);
 
+  // 席位收缩：限额变小、或档案过期使无档案在席卖家超限时，让超额席位退出。
+  // 退出只做 drain：停止分配新块，已确认付款与在途责任照常完成。
+  const trimmed = new Set<string>();
+  {
+    const order = [...desired].sort(bestSeatFirst(s));
+    const keep = new Set<string>();
+    let unmeasured = 0;
+    for (const id of order) {
+      const archived = hasArchive(s, id);
+      if (keep.size >= seatCap(s) || (!archived && unmeasured >= unmeasuredCap(s))) { trimmed.add(id); continue; }
+      keep.add(id); if (!archived) unmeasured++;
+    }
+    for (const id of trimmed) desired.delete(id);
+  }
+
   const claimed = new Set(Object.values(s.requests).filter(r => ["pending", "unresolved"].includes(r.state)).flatMap(r => r.contentIds));
-  let capacityDrain = false;
+  const drainedSellers = new Set<string>();
   for (const p of livePools) {
     if (p.funding !== "open" || p.requestId) continue;
     if (p.scheduling === "draining") continue;
@@ -178,7 +211,9 @@ function plan(s: State): Command[] {
     const probe = needsProbe(s, p.sellerId);
     if (items.length) {
       const seedFirst = items[0].kind === "seed";
-      const limit = seedFirst || probe ? 1 : Math.max(0, p.blockCapacity - p.purchasedBlocks);
+      const remaining = Math.max(0, p.blockCapacity - p.purchasedBlocks);
+      // 探速只派一个真实块，但同样受池块容量约束，不能越过 purchasedBlocks ≤ blockCapacity。
+      const limit = seedFirst ? 1 : probe ? Math.min(1, remaining) : remaining;
       items = items.slice(0, limit);
     }
     while (items.length && items.reduce((n, c) => n + price(p.quote, c), 0n)
@@ -186,7 +221,7 @@ function plan(s: State): Command[] {
     if (!items.length) {
       if (availableContent(s, p.quote).some(c => !claimed.has(c.id))) {
         drain(s, p, commands, "pool-capacity");
-        capacityDrain = true;
+        drainedSellers.add(p.sellerId);
       }
       continue;
     }
@@ -205,7 +240,7 @@ function plan(s: State): Command[] {
   }
 
   // 只有发生"池下载完成并进入 drain"时，才做一次席位评审；不在每个事件全量重排。
-  if (capacityDrain && enabled) reviewSeats(s, desired, qualified);
+  if (drainedSellers.size && enabled) reviewSeats(s, drainedSellers, desired, qualified);
 
   for (const p of livePools) {
     if (!enabled) { drain(s, p, commands, complete ? "content-complete" : s.intent); continue; }
@@ -228,11 +263,11 @@ function plan(s: State): Command[] {
     // 补席位：有档案者按速度降序优先；无档案者随机补浮动位。
     const cap = seatCap(s);
     if (desired.size < cap) {
-      const measuredIdle = qualified.filter(q => !desired.has(q.sellerId) && hasArchive(s, q.sellerId))
+      const measuredIdle = qualified.filter(q => !desired.has(q.sellerId) && !trimmed.has(q.sellerId) && hasArchive(s, q.sellerId))
         .sort((a, b) => (sellerSpeed(s, b.sellerId)! - sellerSpeed(s, a.sellerId)!) || a.sellerId.localeCompare(b.sellerId));
       for (const q of measuredIdle) { if (desired.size >= cap) break; desired.add(q.sellerId); }
       let unmeasured = [...desired].filter(id => !hasArchive(s, id)).length;
-      const unmeasuredIdle = qualified.filter(q => !desired.has(q.sellerId) && !hasArchive(s, q.sellerId)).map(q => q.sellerId);
+      const unmeasuredIdle = qualified.filter(q => !desired.has(q.sellerId) && !trimmed.has(q.sellerId) && !hasArchive(s, q.sellerId)).map(q => q.sellerId);
       while (desired.size < cap && unmeasured < unmeasuredCap(s) && unmeasuredIdle.length) {
         const chosen = pickRandom(s, unmeasuredIdle);
         unmeasuredIdle.splice(unmeasuredIdle.indexOf(chosen), 1);
@@ -259,6 +294,8 @@ function plan(s: State): Command[] {
         count--;
       }
       if (count < 0) continue;
+      // 没有 Seed 可买、块数又降到 0：这个池买不到任何内容，只会在关闭时白白花掉开池费。等资金。
+      if (count === 0 && seeds.length === 0) continue;
       const poolId = nextId(s, "pool");
       const command: Command = { ...base(s, "selected-seller"), type: "open", poolId,
         sellerId: q.sellerId, sessionId: q.sessionId, quote: clone(q), amount: String(amount),
