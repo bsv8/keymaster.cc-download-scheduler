@@ -24,7 +24,7 @@ export interface Config {
   baseSeats: number;
   /** 浮动位：在席且没有速度档案的卖家不超过该数量。 */
   floatingSeats: number;
-  /** 一个费用池 = 一批 = 一次请求的块数上限，同时是派发粒度。 */
+  /** 单次购买请求块数上限；不是池的累计购买上限。 */
   poolBlocks: number;
   /** 请求停摆超时：连续这么久没有新字节就判停摆，不是整批总时长。 */
   requestTimeoutMs: number;
@@ -52,7 +52,10 @@ export interface Seller {
 export type PoolFunding = "opening" | "open" | "closing" | "closed" | "failed" | "problem";
 export interface Pool {
   id: string; taskId: string; sellerId: string; sessionId: string;
-  quote: Quote; fees: Fees; amount: Sats; committed: Sats; blockCapacity: number; purchasedBlocks: number;
+  /** 自动开池时的历史报价，仅供审计，不限制后续购买报价。 */
+  quote?: Quote;
+  openingFee: Sats;
+  fees: Fees; amount: Sats; committed: Sats; blockCapacity: number; purchasedBlocks: number;
   funding: PoolFunding; scheduling: "idle" | "serving" | "draining" | "retired";
   openCommandId: string; closeCommandId: string | null;
   requestId: string | null; drainReason: string | null;
@@ -62,12 +65,19 @@ export interface Pool {
 }
 export interface Request {
   id: string; commandId: string; poolId: string; contentIds: string[];
+  /** 本次工作的报价；更换报价不重置费用池累计付款。 */
+  quote: Quote;
   prices: Record<string, Sats>; startedAt: number; lastProgressAt: number;
-  transferredBytes: number; state: "pending" | "unresolved" | "settled" | "rejected";
+  transferredBytes: number; state: "planned" | "pending" | "unresolved" | "settled" | "rejected";
 }
 export interface State {
   version: 1; taskId: string; seedHash: string; revision: number; sequence: number; now: number;
   config: Config; intent: "ready" | "run" | "pause" | "cancel";
+  /** 终态错误：停止新增工作，但在途和资金责任继续处理。 */
+  failure: { code: "insufficient-funds"; sellerId: string; required: Sats; available: Sats } | null;
+  /** 宿主是否具备报价查询端口；只由策略发 discover，不在宿主按池寿命重查。
+   * 一次查询没有可用报价时不循环重试；新可用报价或显式 resume 才允许下一次。 */
+  quoteDiscovery?: { enabled: boolean; armed: boolean; requested: boolean; failed: boolean; pendingCommandId: string | null };
   price: Slider;
   /** 当前持有席位的卖家；池关闭与重开之间保持，只在席位评审时变更。 */
   seats: string[];
@@ -84,9 +94,13 @@ export type Payload =
   | { type: "automatic"; slider: "price" }
   | { type: "manifest"; content: Content[]; reused?: string[] }
   | { type: "quote"; quote: Quote }
+  | { type: "quote-source"; enabled: boolean }
+  | { type: "quotes-requested" | "quotes-request-failed"; commandId: string }
   | { type: "seller"; sellerId: string; online: boolean }
   | { type: "wallet"; revision: number; available: Sats; reflectedCommands: string[] }
   | { type: "fees"; poolId: string; fees: Fees }
+  /** 宿主验证后的既存池事实，不要求文件或开池报价。 */
+  | { type: "pool-available"; poolId: string; sellerId: string; sessionId: string; amount: Sats; committed: Sats; fees: Fees }
   | { type: "opened"; poolId: string; commandId: string }
   | { type: "open-failed"; poolId: string; commandId: string; released: boolean }
   | { type: "unknown"; poolId: string; commandId: string }
@@ -103,9 +117,10 @@ export interface CommandBase {
   commandId: string; taskId: string; revision: number; reason: string;
 }
 export type Command = CommandBase & (
+  | { type: "discover" }
   | { type: "open"; poolId: string; sellerId: string; sessionId: string; quote: Quote;
-      amount: Sats; contentBudget: Sats; reserve: Sats; openingFee: Sats; walletRevision: number; blockCapacity: number }
-  | { type: "download"; poolId: string; requestId: string; contentIds: string[];
+      amount: Sats; contentBudget: Sats; reserve: Sats; openingFee: Sats; walletRevision: number; blockCapacity: number; requestId: string; contentIds: string[] }
+  | { type: "download"; poolId: string; requestId: string; quote: Quote; contentIds: string[];
       prices: Record<string, Sats>; maxPayment: Sats; priceLimit: Sats; feeVersion: number }
   | { type: "drain"; poolId: string }
   | { type: "close"; poolId: string; committed: Sats }
@@ -128,6 +143,7 @@ export interface SellerSpeedView {
 export interface View {
   taskId: string; revision: number;
   execution: "ready" | "running" | "waiting" | "paused" | "stopping" | "stopped" | "finished";
+  failure: State["failure"];
   content: "manifest-unknown" | "incomplete" | "complete";
   funds: "none" | "pending" | "settled" | "problem";
   price: SliderView;

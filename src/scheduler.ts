@@ -1,4 +1,4 @@
-import { availableContent, hasArchive, pendingContent, recommendations, seatCap, sellerSpeed, unmeasuredCap, view } from "./recommend.js";
+import { availableContent, hasArchive, pendingContent, recommendations, seatCap, sellerSpeed, unmeasuredCap, validQuotes, view } from "./recommend.js";
 import { identity, integer, price, reserve, sats, validateFees, validateQuote } from "./math.js";
 import { addContent, assertRequestPrices, recordFailedAttempt, reduce } from "./reducer.js";
 import type { Command, Config, Content, Event, Pool, Quote, Result, State } from "./types.js";
@@ -17,7 +17,7 @@ export function createTask(input: {
   const state: State = {
     version: 1, taskId: input.taskId, seedHash: input.seedHash, revision: 0, sequence: 0, now: 0,
     config: clone(input.config), intent: "ready",
-    price: { mode: "auto", manualValue: null }, seats: [],
+    failure: null, price: { mode: "auto", manualValue: null }, seats: [],
     manifestKnown: input.manifestKnown, content: {}, completed: {}, sellers: {}, pools: {}, requests: {},
     wallet: { revision: -1, available: "0", reflectedCommands: [] }, spent: "0", seenEvents: {},
   };
@@ -30,9 +30,20 @@ export function restoreTask(snapshot: State): State {
   const s = clone(snapshot);
   if (s.version !== 1 || !s.taskId || !s.seedHash) throw new Error("Unsupported task snapshot");
   validateConfig(s.config); integer(s.now); integer(s.revision); integer(s.sequence);
+  s.failure ??= null;
+  if (s.quoteDiscovery) {
+    for (const key of ["enabled", "armed", "requested", "failed"] as const) {
+      if (typeof s.quoteDiscovery[key] !== "boolean") throw new Error("Invalid quote discovery state");
+    }
+    if (s.quoteDiscovery.pendingCommandId !== null) identity(s.quoteDiscovery.pendingCommandId);
+  }
   identity(s.taskId); identity(s.seedHash);
   if (!["ready", "run", "pause", "cancel"].includes(s.intent)) throw new Error("Invalid snapshot intent");
   sats(s.spent); sats(s.wallet.available);
+  if (s.failure !== null) {
+    if (s.failure.code !== "insufficient-funds" || !s.sellers[s.failure.sellerId]) throw new Error("Invalid task failure");
+    sats(s.failure.required); sats(s.failure.available);
+  }
   if (!s.price || !["auto", "manual"].includes(s.price.mode)) throw new Error("Invalid snapshot slider");
   if (s.price.manualValue !== null) sats(s.price.manualValue);
   if (s.price.mode === "manual" && s.price.manualValue === null) throw new Error("Missing manual target");
@@ -58,12 +69,13 @@ export function restoreTask(snapshot: State): State {
     if (seller.lastAt !== null) integer(seller.lastAt, 0);
   }
   for (const p of Object.values(s.pools)) {
-    if (p.taskId !== s.taskId) throw new Error("Cross-task pool snapshot");
-    validateQuote(p.quote); validateFees(p.fees);
-    if (!s.sellers[p.sellerId] || p.quote.sellerId !== p.sellerId) throw new Error("Missing pool seller");
+    if (p.quote) validateQuote(p.quote);
+    p.openingFee ??= p.quote?.fees.opening ?? "0";
+    sats(p.openingFee); validateFees(p.fees);
+    if (!s.sellers[p.sellerId] || (p.quote && p.quote.sellerId !== p.sellerId)) throw new Error("Missing pool seller");
     if (!["opening", "open", "closing", "closed", "failed", "problem"].includes(p.funding)) throw new Error("Invalid funding state");
     integer(p.blockCapacity); integer(p.purchasedBlocks);
-    if (p.purchasedBlocks > p.blockCapacity) throw new Error("Pool block capacity exceeded");
+    // 累计购买量不限制池寿命；每次派发按金额和实际费用重新判断。
     sats(p.amount); sats(p.committed);
     if (sats(p.committed) > sats(p.amount)) throw new Error("Corrupt pool commitment");
     if (p.requestId && !s.requests[p.requestId]) throw new Error("Missing unresolved request");
@@ -72,7 +84,13 @@ export function restoreTask(snapshot: State): State {
   for (const r of Object.values(s.requests)) {
     if (!s.pools[r.poolId] || r.contentIds.some(id => !s.content[id])) throw new Error("Orphan request");
     if (new Set(r.contentIds).size !== r.contentIds.length) throw new Error("Duplicate request content");
-    if (["pending", "unresolved"].includes(r.state)) {
+    if (!r.quote) {
+      const original = s.pools[r.poolId].quote;
+      if (!original) throw new Error("Missing purchase quote evidence");
+      r.quote = clone(original);
+    }
+    validateQuote(r.quote);
+    if (["planned", "pending", "unresolved"].includes(r.state)) {
       if (s.pools[r.poolId].requestId !== r.id) throw new Error("Request ownership mismatch");
       for (const id of r.contentIds) { if (claims.has(id) || s.completed[id]) throw new Error("Duplicate outstanding content"); claims.add(id); }
     }
@@ -95,9 +113,9 @@ function drain(s: State, p: Pool, commands: Command[], reason: string) {
 }
 function walletFree(s: State): bigint {
   // 无关的钱包修订号更新，不能证明本地资金占用已反映到快照。
-  const unreflected = Object.values(s.pools).filter(p => p.funding !== "failed"
+  const unreflected = Object.values(s.pools).filter(p => p.openCommandId && p.funding !== "failed"
     && !s.wallet.reflectedCommands.includes(p.openCommandId))
-    .reduce((n, p) => n + sats(p.amount) + sats(p.quote.fees.opening), 0n);
+    .reduce((n, p) => n + sats(p.amount) + sats(p.openingFee), 0n);
   return sats(s.wallet.available) - unreflected;
 }
 /** 确定性伪随机：同一状态与候选集合在重放中必然选中同一卖家。 */function pickRandom(s: State, ids: string[]): string {
@@ -126,8 +144,8 @@ function bestSeatFirst(s: State) {
 }
 
 /**
- * 席位评审：只在费用池"下载完成并进入 drain"的那一刻发生。
- * 只评审**本轮刚进入 drain** 的卖家（显式传入），不拿历史 draining 池重复评审。
+ * 席位评审：仅在一次购买已明确结束后评审该卖家。
+ * 与资金池是否耗尽、是否关闭无关，不对其他在途卖家重新洗牌。
  * 排名集合 = 在席且已测速的卖家（在途者只参与算名次）。
  * 名次 ≤ 基础名额 → 保留；名次 > 基础名额 → 一换一：
  *   a. 闲置已测速卖家里最快且比它快 → 替换；
@@ -157,155 +175,164 @@ function reviewSeats(s: State, drained: Set<string>, desired: Set<string>, quali
   }
 }
 
-function plan(s: State): Command[] {
+/** 连一块及其完整费用也无法支付即终态失败；不换便宜卖家、不等待回款。 */
+function failFunds(s: State, sellerId: string, required: bigint, available: bigint) {
+  s.failure ??= { code: "insufficient-funds", sellerId, required: String(required), available: String(available > 0n ? available : 0n) };
+}
+
+function contentCost(q: Quote, items: Content[]): bigint {
+  return items.reduce((n, item) => n + price(q, item), 0n);
+}
+
+/** 一份工作从准备资金起排他占用内容；池可用后发出同一份工作。 */
+function dispatch(s: State, p: Pool, r: State["requests"][string], commands: Command[]) {
+  r.state = "pending"; r.startedAt = s.now; r.lastProgressAt = s.now;
+  const command: Command = { ...base(s, s.content[r.contentIds[0]].kind === "seed" ? "seed-first" : "download"),
+    type: "download", poolId: p.id, requestId: r.id, quote: clone(r.quote), contentIds: [...r.contentIds], prices: { ...r.prices },
+    maxPayment: String(Object.values(r.prices).reduce((n, v) => n + sats(v), 0n)),
+    priceLimit: String(recommendations(s).effective), feeVersion: p.fees.version };
+  r.commandId = command.commandId; p.requestId = r.id; p.scheduling = "serving";
+  commands.push(command);
+}
+
+function plan(s: State, reviewedSeller?: string): Command[] {
   const commands: Command[] = [];
   for (const r of Object.values(s.requests)) {
     if (r.state !== "pending" || s.now < r.lastProgressAt + s.config.requestTimeoutMs) continue;
-    // 停摆是网络错误：请求结束、卖家按零字节记一次尝试（已测、不拉黑），池走正常关池回收。
     const p = s.pools[r.poolId];
-    r.state = "rejected"; p.requestId = null;
+    // 超时不能证明已发授权的责任消失。留作未决，不能重买原内容。
+    r.state = "unresolved";
     recordFailedAttempt(s.sellers[p.sellerId], r.transferredBytes, r.startedAt, s.now);
     drain(s, p, commands, "request-timeout");
+    p.funding = "problem"; p.scheduling = "retired";
   }
   const rec = recommendations(s);
+  if (s.quoteDiscovery && validQuotes(s).length) {
+    s.quoteDiscovery.armed = true; s.quoteDiscovery.failed = false;
+  }
   const complete = s.manifestKnown && pendingContent(s).length === 0;
-  const enabled = s.intent === "run" && !complete;
+  const enabled = s.intent === "run" && !s.failure && !complete;
   const awaitingManifest = !s.manifestKnown && pendingContent(s).length === 0;
-  const livePools = Object.values(s.pools).filter(live);
   const qualified = enabled ? rec.quotes : [];
-  const qualifiedIds = new Set(qualified.map(q => q.sellerId));
-
-  // 基础席位：持久化席位中仍在候选集合里的卖家。未合格的席位自动退出。
-  const desired = new Set<string>();
-  for (const id of s.seats) if (qualifiedIds.has(id)) desired.add(id);
-
-  // 席位收缩：限额变小、或出现未测速在席卖家超限时，让超额席位退出。
-  // 退出只做 drain：停止分配新块，已确认付款与在途责任照常完成。
+  const ids = new Set(qualified.map(q => q.sellerId));
+  const desired = new Set(s.seats.filter(id => awaitingManifest || ids.has(id)));
   const trimmed = new Set<string>();
-  {
-    const order = [...desired].sort(bestSeatFirst(s));
-    const keep = new Set<string>();
-    let unmeasured = 0;
-    for (const id of order) {
-      const archived = hasArchive(s, id);
-      if (keep.size >= seatCap(s) || (!archived && unmeasured >= unmeasuredCap(s))) { trimmed.add(id); continue; }
-      keep.add(id); if (!archived) unmeasured++;
-    }
-    for (const id of trimmed) desired.delete(id);
+  let unmeasured = 0, kept = 0;
+  for (const id of [...desired].sort(bestSeatFirst(s))) {
+    const measured = hasArchive(s, id);
+    if (kept >= seatCap(s) || (!measured && unmeasured >= unmeasuredCap(s))) {
+      desired.delete(id); trimmed.add(id);
+    } else { kept++; if (!measured) unmeasured++; }
   }
-
-  const claimed = new Set(Object.values(s.requests).filter(r => ["pending", "unresolved"].includes(r.state)).flatMap(r => r.contentIds));
-  const drainedSellers = new Set<string>();
-  for (const p of livePools) {
-    if (p.funding !== "open" || p.requestId) continue;
-    if (p.scheduling === "draining") continue;
-    if (!enabled || awaitingManifest) continue;
-    if (!desired.has(p.sellerId)) continue;
-    // 锁价合同可以在原报价过期后继续使用；新请求仍受当前有效价格上限约束。
-    if (sats(p.quote.blockPrice) > rec.effective) continue;
-    let items = availableContent(s, p.quote).filter(c => !claimed.has(c.id));
-    if (items.length) {
-      const seedFirst = items[0].kind === "seed";
-      const remaining = Math.max(0, p.blockCapacity - p.purchasedBlocks);
-      // 一个池 = 一批 = 一次请求：首次也是正式下载，一次派满剩余容量（Seed 单条目先买）。
-      items = items.slice(0, seedFirst ? 1 : remaining);
-    }
-    while (items.length && items.reduce((n, c) => n + price(p.quote, c), 0n)
-      + reserve(p.fees, items.length) > sats(p.amount) - sats(p.committed)) items.pop();
-    if (!items.length) {
-      if (availableContent(s, p.quote).some(c => !claimed.has(c.id))) {
-        drain(s, p, commands, "pool-capacity");
-        drainedSellers.add(p.sellerId);
-      }
-      continue;
-    }
-    const requestId = nextId(s, "request");
-    const prices = Object.fromEntries(items.map(c => [c.id, String(price(p.quote, c))]));
-    const command: Command = { ...base(s, items[0].kind === "seed" ? "seed-first" : "download"),
-      type: "download", poolId: p.id, requestId, contentIds: items.map(c => c.id), prices,
-      maxPayment: String(Object.values(prices).reduce((n, v) => n + sats(v), 0n)),
-      priceLimit: String(rec.effective), feeVersion: p.fees.version };
-    s.requests[requestId] = { id: requestId, commandId: command.commandId, poolId: p.id,
-      contentIds: command.contentIds, prices, startedAt: s.now, lastProgressAt: s.now,
-      transferredBytes: 0, state: "pending" };
-    p.requestId = requestId; p.scheduling = "serving";
-    for (const c of items) claimed.add(c.id);
-    commands.push(command);
-  }
-
-  // 只有发生"池下载完成并进入 drain"时，才做一次席位评审；不在每个事件全量重排。
-  if (drainedSellers.size && enabled) reviewSeats(s, drainedSellers, desired, qualified);
-
-  for (const p of livePools) {
-    if (!enabled) { drain(s, p, commands, complete ? "content-complete" : s.intent); continue; }
-    if (awaitingManifest) continue;
-    if (!desired.has(p.sellerId)) {
-      drain(s, p, commands, sats(p.quote.blockPrice) > rec.effective ? "price-limit" : "strategy-change");
-    }
-  }
-
-  for (const p of Object.values(s.pools)) {
-    if (p.funding !== "open" || p.requestId) continue;
-    if (p.scheduling === "draining") {
-      const command: Command = { ...base(s, p.drainReason ?? "drain-complete"), type: "close", poolId: p.id, committed: p.committed };
-      p.funding = "closing"; p.closeCommandId = command.commandId; commands.push(command);
-    }
-  }
-
+  if (enabled && reviewedSeller) reviewSeats(s, new Set([reviewedSeller]), desired, qualified);
   if (enabled && !awaitingManifest) {
-    // 补席位：有档案者按速度降序优先；未测速者随机补浮动位。
-    const cap = seatCap(s);
-    if (desired.size < cap) {
-      const measuredIdle = qualified.filter(q => !desired.has(q.sellerId) && !trimmed.has(q.sellerId) && hasArchive(s, q.sellerId))
-        .sort((a, b) => (sellerSpeed(s, b.sellerId)! - sellerSpeed(s, a.sellerId)!) || a.sellerId.localeCompare(b.sellerId));
-      for (const q of measuredIdle) { if (desired.size >= cap) break; desired.add(q.sellerId); }
-      let unmeasured = [...desired].filter(id => !hasArchive(s, id)).length;
-      const unmeasuredIdle = qualified.filter(q => !desired.has(q.sellerId) && !trimmed.has(q.sellerId) && !hasArchive(s, q.sellerId)).map(q => q.sellerId);
-      while (desired.size < cap && unmeasured < unmeasuredCap(s) && unmeasuredIdle.length) {
-        const chosen = pickRandom(s, unmeasuredIdle);
-        unmeasuredIdle.splice(unmeasuredIdle.indexOf(chosen), 1);
-        desired.add(chosen); unmeasured++;
-      }
-    }
-    for (const id of desired) {
-      if (livePools.some(p => p.sellerId === id && active(p))) continue;
-      const q = qualified.find(x => x.sellerId === id);
-      if (!q) continue;
-      const seller = s.sellers[id];
-      const newQuote = seller.quote;
-      if (!newQuote || newQuote.expiresAt <= s.now || newQuote.id !== q.id || newQuote.version !== q.version) continue;
-      const items = pendingContent(s).filter(c => !claimed.has(c.id) && (!q.contentIds || q.contentIds.includes(c.id)));
-      if (!items.length) continue;
-      const blocks = items.filter(c => c.kind === "block");
-      const seeds = items.filter(c => c.kind === "seed");
-      let count = Math.min(blocks.length, q.maxBlocks, s.config.poolBlocks);
-      let budget = 0n, amount = 0n;
-      while (count >= 0) {
-        budget = [...seeds, ...blocks.slice(0, count)].reduce((n, c) => n + price(q, c), 0n);
-        amount = budget + reserve(q.fees, Math.max(1, count));
-        if (amount + sats(q.fees.opening) <= walletFree(s)) break;
-        count--;
-      }
-      if (count < 0) continue;
-      // 没有 Seed 可买、块数又降到 0：这个池买不到任何内容，只会在关闭时白白花掉开池费。等资金。
-      if (count === 0 && seeds.length === 0) continue;
-      const poolId = nextId(s, "pool");
-      const command: Command = { ...base(s, "selected-seller"), type: "open", poolId,
-        sellerId: q.sellerId, sessionId: q.sessionId, quote: clone(q), amount: String(amount),
-        contentBudget: String(budget), reserve: String(amount - budget), openingFee: q.fees.opening,
-        walletRevision: s.wallet.revision, blockCapacity: count };
-      s.pools[poolId] = {
-        id: poolId, taskId: s.taskId, sellerId: q.sellerId, sessionId: q.sessionId,
-        quote: clone(q), fees: clone(q.fees), amount: command.amount, committed: "0", blockCapacity: count, purchasedBlocks: 0,
-        funding: "opening", scheduling: "idle", openCommandId: command.commandId,
-        closeCommandId: null, requestId: null, drainReason: null, returned: null,
-        refundAvailable: false, openingObserved: false,
-        walletRevisionAtIntent: s.wallet.revision,
-      };
-      commands.push(command);
+    const measured = qualified.filter(q => !desired.has(q.sellerId) && !trimmed.has(q.sellerId) && hasArchive(s, q.sellerId))
+      .sort((a, b) => (sellerSpeed(s, b.sellerId)! - sellerSpeed(s, a.sellerId)!) || a.sellerId.localeCompare(b.sellerId));
+    for (const q of measured) { if (desired.size >= seatCap(s)) break; desired.add(q.sellerId); }
+    const newcomers = qualified.filter(q => !desired.has(q.sellerId) && !trimmed.has(q.sellerId) && !hasArchive(s, q.sellerId)).map(q => q.sellerId);
+    unmeasured = [...desired].filter(id => !hasArchive(s, id)).length;
+    while (desired.size < seatCap(s) && unmeasured < unmeasuredCap(s) && newcomers.length) {
+      const id = pickRandom(s, newcomers); newcomers.splice(newcomers.indexOf(id), 1);
+      desired.add(id); unmeasured++;
     }
   }
   s.seats = [...desired];
+
+  // 取消尚未形成购买授权的工作；pending/unresolved 责任不能因此解除。
+  for (const p of Object.values(s.pools).filter(live)) {
+    const exit = !enabled ? (s.failure?.code ?? (complete ? "content-complete" : s.intent))
+      : !awaitingManifest && !desired.has(p.sellerId) ? "strategy-change" : undefined;
+    if (!exit || (s.intent === "ready" && !s.failure && !complete)) continue;
+    const r = p.requestId ? s.requests[p.requestId] : undefined;
+    if (r?.state === "planned" && (!s.failure || s.intent !== "run" || complete)) { r.state = "rejected"; p.requestId = null; }
+    drain(s, p, commands, exit);
+  }
+
+  // 已分配且已持久化的工作继续；终态错误仅阻止新分配，不能随回调顺序撤销它。
+  if (s.intent === "run" && !complete) for (const p of Object.values(s.pools)) {
+    const r = p.requestId ? s.requests[p.requestId] : undefined;
+    if (p.funding !== "open" || r?.state !== "planned") continue;
+    const items = r.contentIds.map(id => s.content[id]);
+    if (sats(r.quote.blockPrice) > rec.effective || r.quote.expiresAt <= s.now
+      || contentCost(r.quote, items) + reserve(p.fees, items.length) > sats(p.amount) - sats(p.committed)) {
+      r.state = "rejected"; p.requestId = null;
+      drain(s, p, commands, "work-invalidated");
+    } else dispatch(s, p, r, commands);
+  }
+
+  const claimed = new Set(Object.values(s.requests)
+    .filter(r => ["planned", "pending", "unresolved"].includes(r.state)).flatMap(r => r.contentIds));
+  const measuredOrder = [...desired].filter(id => hasArchive(s, id))
+    .sort((a, b) => (sellerSpeed(s, b)! - sellerSpeed(s, a)!) || a.localeCompare(b));
+  const randomOrder: string[] = [];
+  const remaining = [...desired].filter(id => !hasArchive(s, id));
+  while (remaining.length) { const id = pickRandom(s, remaining); remaining.splice(remaining.indexOf(id), 1); randomOrder.push(id); }
+
+  if (enabled && !awaitingManifest) for (const id of [...measuredOrder, ...randomOrder]) {
+    if (s.failure) break;
+    let p = Object.values(s.pools).find(p => p.sellerId === id && live(p) && active(p));
+    const old = p?.requestId ? s.requests[p.requestId] : undefined;
+    if (old) continue;
+    if (p && p.funding !== "open") continue;
+    const q = qualified.find(q => q.sellerId === id);
+    if (!q) continue;
+    let items = availableContent(s, q).filter(item => !claimed.has(item.id));
+    items = items.slice(0, items[0]?.kind === "seed" ? 1 : Math.min(q.maxBlocks, s.config.poolBlocks));
+    if (!items.length) continue;
+    if (p) {
+      const affordable = [...items];
+      while (affordable.length && contentCost(q, affordable) + reserve(p.fees, affordable.length) > sats(p.amount) - sats(p.committed)) affordable.pop();
+      if (affordable.length) items = affordable;
+      else { drain(s, p, commands, "pool-exhausted"); p = undefined; }
+    }
+    if (!p) {
+      // 同卖家旧池仍在关，不借预计回款；若已有其他实际钱包资金则允许准备工作。
+      const free = walletFree(s);
+      const minimum = price(q, items[0]) + reserve(q.fees, 1) + sats(q.fees.opening);
+      while (items.length && contentCost(q, items) + reserve(q.fees, items.length) + sats(q.fees.opening) > free) items.pop();
+      if (!items.length) {
+        failFunds(s, id, minimum, free);
+        break;
+      }
+    }
+    const requestId = nextId(s, "request");
+    const poolId = p?.id ?? nextId(s, "pool");
+    const prices = Object.fromEntries(items.map(item => [item.id, String(price(q, item))]));
+    const work: State["requests"][string] = { id: requestId, commandId: "", poolId,
+      quote: clone(q), contentIds: items.map(item => item.id), prices,
+      startedAt: s.now, lastProgressAt: s.now, transferredBytes: 0, state: "planned" };
+    s.requests[requestId] = work;
+    for (const item of items) claimed.add(item.id);
+    if (p) { dispatch(s, p, work, commands); continue; }
+    const budget = contentCost(q, items), reserved = reserve(q.fees, items.length);
+    const count = items.filter(item => item.kind === "block").length;
+    const command: Command = { ...base(s, "work-assigned"), type: "open", poolId,
+      sellerId: id, sessionId: q.sessionId, quote: clone(q), amount: String(budget + reserved),
+      contentBudget: String(budget), reserve: String(reserved), openingFee: q.fees.opening,
+      walletRevision: s.wallet.revision, blockCapacity: count, requestId, contentIds: [...work.contentIds] };
+    work.commandId = command.commandId;
+    s.pools[poolId] = { id: poolId, taskId: s.taskId, sellerId: id, sessionId: q.sessionId,
+      quote: clone(q), openingFee: q.fees.opening, fees: clone(q.fees), amount: command.amount, committed: "0", blockCapacity: count, purchasedBlocks: 0,
+      funding: "opening", scheduling: "idle", openCommandId: command.commandId,
+      closeCommandId: null, requestId, drainReason: null, returned: null, refundAvailable: false,
+      openingObserved: false, walletRevisionAtIntent: s.wallet.revision };
+    commands.push(command);
+  }
+
+  const discovery = s.quoteDiscovery;
+  if (s.intent === "run" && !s.failure && !complete && !awaitingManifest
+    && discovery?.enabled && !discovery.pendingCommandId && (!discovery.requested || discovery.armed)
+    && !validQuotes(s).length && pendingContent(s).some(item => !claimed.has(item.id))) {
+    const command: Command = { ...base(s, "quotes-unavailable"), type: "discover" };
+    discovery.pendingCommandId = command.commandId; discovery.requested = true; discovery.armed = false;
+    commands.push(command);
+  }
+  if (s.failure) for (const p of Object.values(s.pools).filter(live)) drain(s, p, commands, s.failure.code);
+  for (const p of Object.values(s.pools)) {
+    if (p.funding !== "open" || p.requestId || p.scheduling !== "draining") continue;
+    const command: Command = { ...base(s, p.drainReason ?? "drain-complete"), type: "close", poolId: p.id, committed: p.committed };
+    p.funding = "closing"; p.closeCommandId = command.commandId; commands.push(command);
+  }
   return commands;
 }
 
@@ -334,6 +361,8 @@ export function step(previous: State, event: Event): Result {
   const s = clone(previous);
   s.now = event.receivedAt; s.revision++; s.seenEvents[event.eventId] = true;
   reduce(s, event);
-  const commands = plan(s);
+  const reviewed = event.type === "delivery" && previous.requests[event.requestId]?.state !== "settled"
+    ? previous.pools[previous.requests[event.requestId]?.poolId]?.sellerId : undefined;
+  const commands = plan(s, reviewed);
   return { state: s, commands, view: view(s), nextWakeAt: nextWakeAt(s) };
 }

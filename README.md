@@ -1,78 +1,67 @@
-# keymaster.cc-download-scheduler
+# keymaster-trade-scheduler
 
-独立的文件采购策略器。以文件任务为主线，维护一组"席位卖家"，管理费用池、下载分配与资金责任；用户只有一根价格杆（每块最高购买价）。
+TypeScript 文件采购策略器，唯一源码位于本仓 `src/`；钱包消费本包，不保留内置副本。运行时零依赖，不访问真实时钟、网络、钱包或数据库，不执行签名和广播。Go 唯一实现位于本仓 `go/scheduler/`，module `github.com/bsv8/keymaster.cc-download-scheduler`；CLI 消费该模块，不保留内部副本。两语言遵循同一 TS 业务规则，不允许独立演进。
 
-运行时零依赖。内核不访问时钟、网络、钱包、数据库或主项目；不签名或广播交易。测试与外围模拟在独立工程仓库中。
+## 构建与使用
 
-## 构建
-
-Node.js 22，TypeScript 5.9。安装开发依赖后运行 `npm run build`；输出到 `dist/`。也可以使用已有 TypeScript 编译器运行 `tsc -p tsconfig.json`。
+Node.js 22、TypeScript 5.9。本仓运行 `pnpm install && pnpm build`，或使用 TypeScript 编译器执行 `tsc -p tsconfig.json`，输出到 `dist/`；消费前先构建，包导出仅指向 `dist/`。cc 当前通过本地 `file:` 依赖安装构建产物，不访问本仓源码。Go 在 `go/` 运行 `go build ./...`，仅依赖标准库；CLI 当前以本地 `replace` 引入，构建不依赖 Node.js。
 
 ```ts
-import { createTask, step, restoreTask } from 'keymaster.cc-download-scheduler';
+import { createTask, step, restoreTask } from 'keymaster-trade-scheduler';
 
 let state = createTask({
   taskId: 'purchase-1', seedHash: 'file-seed-hash', manifestKnown: true,
   content: [{ id: 'block-hash-1', kind: 'block', bytes: 262144 }],
   config: {
-    // 系统缺省块价：任务未单独设置时使用，不是授权上限。唯一硬边界是钱包可用余额。
-    maxBlockPrice: '10',
-    // 席位：基础名额 + 浮动位（在席但还没有测过速的卖家上限，给新卖家测速用）。
+    maxBlockPrice: '10', // 未设置任务价格杆时的缺省完整块最高价
     baseSeats: 6, floatingSeats: 2,
-    // 一个费用池 = 一批 = 一次请求的块数上限。
-    poolBlocks: 4,
-    // 连续这么久没有新字节就判停摆；不是整批总时长。
-    requestTimeoutMs: 5000,
+    poolBlocks: 4, // 单次请求上限，不限制池的累计购买量
+    requestTimeoutMs: 5000, // 无新字节的停摆时限
   },
 });
-
 const result = step(state, {
-  type: 'start', eventId: 'event-1', taskId: state.taskId, occurredAt: 0, receivedAt: 0,
+  type: 'start', eventId: 'event-1', taskId: state.taskId,
+  occurredAt: 0, receivedAt: 0,
 });
 state = result.state;
-// result.commands：交给宿主执行；result.view：UI 投影。
-// result.nextWakeAt：由宿主安排下一次 tick，内核不会真实等待。
 const restored = restoreTask(JSON.parse(JSON.stringify(state)));
 ```
 
-金额为规范十进制整数 sats 字符串，速度为 bytes/s，时间为宿主提供的单调毫秒。报价可声明尾块价，否则使用整数向上取整的按长度计价。
+金额是规范十进制整数 sats 字符串；速度为 bytes/s；时间由宿主注入。`step` 不修改输入，返回 `state / commands / view / nextWakeAt`。宿主原子保存状态和命令 outbox，之后按 `commandId` 幂等执行，并输入经过验证的结果。
 
-## 策略规则
+## 策略
 
-- **一根价格杆**：每块最高购买价。`price.mode` 默认 `auto`，此时有效值 = `config.maxBlockPrice`；用户拖动后进入 `manual`，可以调得比系统缺省更高或更低。v1 **没有自动建议红点**，`SliderView` 只有 `mode / manualValue / effective / range`（`range` 是市场已报价区间的事实）。
-- **杆之下只有一套速度优先策略**：没有 `preference`、没有价格维度、没有任务总支出授权（`maxTotalSpend` 不存在）。
-- **速度是累计事实**：每个卖家只累计"已验收交付的块字节"与"传输耗时"，速度 = 总字节 ÷ 总时间；没有窗口、没有过期、长期保留。测过速但零字节是 0 速（已测），从未尝试过才是未测速，二者分开。
-- **席位**：在席上限 = `baseSeats + floatingSeats`；其中还没有测过速的卖家不超过 `floatingSeats`。席位未满时报价合格就入场；满员后只在费用池"下载完成、无在途、进入 drain"的时刻评审一次，且**只评审本轮刚进入 drain 的卖家**：名次 ≤ `baseSeats` 保留；名次 > `baseSeats` 时按"闲置已测速最快者 → 随机未测速新人 → 不换"一换一。在途者只参与算名次，不被替换。
-- **席位收缩会收敛**：限额变小导致浮动位超限时，最差的超额席位退出；退出只做 drain，已确认付款与在途责任照常完成。
-- **开池额度** = `min(剩余块, 卖家 maxBlocks, poolBlocks)`；首次就是整批正式下载，一次派满；池用尽即关闭，下一轮再决策；买不到任何内容（无 Seed 可买且块数为 0）时不开池，等待资金。
-- **任务内黑名单**：坏块、不可重试拒绝、空验收等确定失败 → 立即拉黑本任务，永不再选。网络错误（连续 `requestTimeoutMs` 没有新字节的停摆）→ 请求结束，卖家按已传字节/耗时累计一次尝试（零字节即 0 速），不拉黑、留待以后。有进度但慢不算失败。
-- **错误不自动修复**：广播结果未知、停摆等资金相关问题把池标记为 `problem`（问题池），交给宿主记录追溯并事后处理；内核不自动查链、不自动重试、不排唤醒，任务继续或正常结束。晚到的可信事实仍然照常记录。
-- 报价更新的 version 对同卖家单调递增；旧池保留绑定报价；被淘汰卖家的档案保留，重新报出更低价格可按价格杆恢复候选。
+- 最高完整块价决定准入；上限内速度优先，不选择便宜卖家弥补资金不足，不提供价格偏好、任务总支出授权或自动价格建议。
+- 席位上限为基础名额加浮动名额；未测速在席数不超过浮动名额。速度按长期累计有效块字节除以累计耗时计算，未测速与已测零速不同。
+- 每次购买结果明确后，只评审对应卖家，按基础排名及候补一换一；其他在途卖家不被打断，没有全局轮次。
+- 先安排卖家及具体内容，再配资金。工作进入 `planned` 后即排他占用内容；池可用后执行同一份工作。
+- 已测在席卖家按累计速度降序获得工作和资金；未测速者按可重放随机顺序。
+- 请求逐块缩量，完整成本包括内容、适用仲裁和结算预留；新池另加开池费。现有池按面额减已承诺金额计算容量，不用预计回款。
+- 池不受累计块数限制。金额足够可多次购买；池和报价分开，请求保存自己的报价。`pool-available` 可以输入没有开池报价的既存池及累计付款事实。
+- 最小有效购买也付不起时记录持久 `failure: insufficient-funds`。同次状态提交中此前已分配的可支付工作保留，之后不新增分配；已有工作完成和资金结算继续。充值、resume 或内容齐全不能清除此错误。
+- 停摆或不可安全重试拒绝不证明授权责任消失：请求保留 `unresolved` 和内容归属，池进入 `problem`，不自动关池或重买。开池未知可解除尚未形成购买授权的计划，但保留问题池及资金占用。可信晚到结果仍可记录。
+- 内容完成、退出、枯竭或错误后的关闭由内核输出。执行层仍验证合同、费用版本、资金、内容、签名和历史责任；不能自行改金额、换卖家、补池或续购。
 
-## 控制与执行契约
+## 输入输出契约
 
-- `slider` / `automatic` 只作用于价格杆。`limits` 是宿主显式变更（缺省块价、席位数），不是自动推荐的输出。
-- 钱包快照必须带修订号及 `reflectedCommands`：哪些开池命令的占用已经包含在 available 中。仅修订号变新不能证明本地占用已被反映。
-- `opened` 表示执行层已验证池可用于请求；`closed` 表示可信关闭结果；`refund-available` 和钱包新快照分别说明回收可用及余额。内核不会提前把回收额加到余额。
-- `delivery` 必须是已经验收内容、付款责任已经对清的执行事实；未确定结果使用 `unknown`，不能先报成功。`unknown` 使池进入问题池并保留请求归属，等待宿主事后处理。
-- 报价更新的 version 对同卖家单调递增；`fees` 更新必须由宿主确认适用于该池合同，不能无条件套用全局新仲裁价格。
-- 宿主应原子持久化新状态与命令 outbox，再执行命令，按 commandId 幂等。重启后用 restoreTask 恢复，未决命令由 outbox 对账或重投；内核不会自动重发已登记命令。
-- 执行前核对实体命令归属、最新停止意图、合同、费用版本、资金和内容授权；revision 是决策依据，不能简单要求整个任务 revision 永远不变。
+- 命令为 `discover / open / download / drain / close`；`discover` 是保留的报价发现候选接口，钱包尚未接入，不能视为已确定的自动重查政策。`open` 携带排他的 `requestId / contentIds`；`download` 携带独立报价、逐项价格及最大付款。
+- 钱包事实包含修订号、余额和 `reflectedCommands`。仅修订号更新不能释放未反映的本地资金占用。
+- `opened / pool-available` 是真实可用池事实；`delivery` 是内容已验收、付款责任已明确的事实。
+- `closed / refund-available / wallet` 分别确认关闭、回款可用和真实钱包余额；内核不自行把预计回款加入余额。
+- `fees` 只能输入确实适用于对应池的费用事实。池合同变化不能由宿主静默改写命令。
+- `view` 分开表达执行、内容和资金状态，并保留任务失败原因。仲裁和结算预留不属于实际支出。
+- 快照和幂等记录可重放；未决命令由 outbox 对账，恢复不会自动重发历史命令或清除责任。
 
-`view` 将执行、内容、资金分为三条状态轴；文件完成不代表资金已结清，池关闭不代表文件完整；问题池移出任务资金账（`funds: problem`），由宿主单独追溯。`view.facts` 只陈述合格数、超上限数、已测/未测数、零速数、黑名单数与在途数，不做任何无数据来源的速度或时间预测；费用预留与实际支出分别展示，剩余内容估价不是未来总支出承诺。
+## 独立验证
 
-## 独立测试与模拟
-
-在同级 `BSV8_Engineering` 目录运行（先安装该工程已有开发依赖）：
+从工程仓库运行：
 
 ```sh
-node test/keymaster.cc-download-scheduler/run.mjs
-node test/keymaster.cc-download-scheduler/run.mjs --simulate --profile market --seed 372
-node test/keymaster.cc-download-scheduler/run.mjs --simulate --count 100 --seed 1 --out /tmp/scheduler-stress.json
-node test/keymaster.cc-download-scheduler/run.mjs --simulate --profile hours --out /tmp/scheduler-hours.json
-node test/keymaster.cc-download-scheduler/run.mjs --simulate --replay /tmp/scheduler-hours.json
+node test/shared/download-scheduler/run.mjs
+node test/shared/download-scheduler/run.mjs --simulate --profile market --seed 372
+SCHEDULER_SEEDS=100 node test/keymaster.cc-cli/scheduler/run.mjs
 ```
 
-外围模拟包含独立资金和内容账本、虚拟时钟、可复现速度/延迟/价格抖动、共享带宽、动态卖家和费用变化，并独立断言席位上限、浮动位限位、池块容量与资金守恒。`--scenario path.json` 可运行自定义配置；失败保存完整轨迹，`--minimize` 可缩减场景输入。
+`npm run test:components:parity` 是工程仓的双组件统一门禁，检查 CLI 实际使用独立 Go 模块及内部副本不存在。调度器交叉测试逐步比较完整状态、命令、视图、唤醒和完整错误文本，拒绝事件不得修改输入；还将双方快照交换后续跑，与原轨迹逐步比较，不只各自恢复自己的快照。
 
-当前版本尚未接入 keymaster.cc，也不修改其采购、签名、交易或历史记录。规则细节与边界见工程仓库 `docs/keymaster.cc-download-scheduler/`。
+独立模型测试不等于真实钱包、协议和链上集成通过，也不是所有输入的穷尽证明。当前能力及执行层边界见工程仓库 `docs/shared/download-scheduler/当前实现.md`。

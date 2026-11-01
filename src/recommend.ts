@@ -41,10 +41,9 @@ export function unmeasuredCap(s: State): number {
 /** 市场有效报价：排除黑名单与失去资格的卖家；是否在价格上限内由调用方过滤。 */
 export function validQuotes(s: State): Quote[] {
   return Object.values(s.sellers).filter(x => x.online && !x.blacklisted).flatMap(seller => {
-    const pool = Object.values(s.pools).find(p => p.sellerId === seller.id
-      && ["open", "opening"].includes(p.funding) && p.scheduling !== "draining" && p.scheduling !== "retired");
-    const q = pool?.quote ?? seller.quote;
-    return q && (pool || q.expiresAt > s.now) && availableContent(s, q).length ? [q] : [];
+    // 报价属于购买，不属于池；池可用也不能让过期报价自动获得新购买资格。
+    const q = seller.quote;
+    return q && q.expiresAt > s.now && availableContent(s, q).length ? [q] : [];
   });
 }
 /** 准入集合：市场报价中价格不超过有效上限者。 */
@@ -84,6 +83,9 @@ export function view(s: State): View {
   const serving = live.filter(p => p.funding === "open" && p.requestId && p.scheduling === "serving");
   const active = live.filter(p => p.funding === "open" && p.scheduling !== "draining" && p.scheduling !== "retired");
   const reasons: string[] = [];
+  if (s.failure) reasons.push(s.failure.code);
+  if (s.quoteDiscovery?.pendingCommandId) reasons.push("requesting-quotes");
+  if (s.quoteDiscovery?.failed) reasons.push("quote-request-failed");
   if (!s.manifestKnown) reasons.push("manifest-unknown");
   if (problem.length) reasons.push("problem-pool");
   if (!rec.quotes.length && !complete) reasons.push("no-eligible-seller");
@@ -97,7 +99,7 @@ export function view(s: State): View {
   }
   let costMin = 0n, costMax = 0n, covered = true;
   for (const item of pendingContent(s)) {
-    const request = Object.values(s.requests).find(r => ["pending", "unresolved"].includes(r.state) && r.contentIds.includes(item.id));
+    const request = Object.values(s.requests).find(r => ["planned", "pending", "unresolved"].includes(r.state) && r.contentIds.includes(item.id));
     const prices = request ? [sats(request.prices[item.id])] : rec.quotes
       .filter(q => !q.contentIds || q.contentIds.includes(item.id)).map(q => price(q, item));
     if (!prices.length) { covered = false; break; }
@@ -114,7 +116,8 @@ export function view(s: State): View {
   const blacklisted = Object.values(s.sellers).filter(x => x.blacklisted).length;
   return {
     taskId: s.taskId, revision: s.revision,
-    execution: complete ? "finished" : s.intent === "ready" ? "ready"
+    failure: s.failure,
+    execution: s.failure ? (requests.length || Object.values(s.requests).some(r => r.state === "planned") ? "stopping" : "stopped") : complete ? "finished" : s.intent === "ready" ? "ready"
       : s.intent === "cancel" ? (requests.length ? "stopping" : "stopped")
       : s.intent === "pause" ? (requests.length ? "stopping" : "paused")
       : requests.length ? "running" : "waiting",
@@ -127,8 +130,8 @@ export function view(s: State): View {
       bytesPerSecond: sellerSpeed(s, x.id), measured: x.measured,
       bytesTotal: x.bytesTotal, timeMsTotal: x.timeMsTotal, lastAt: x.lastAt,
     }])),
-    actualBytesPerSecond: totalSpeed(s, serving.map(p => p.quote)),
-    sustainableBytesPerSecond: totalSpeed(s, active.map(p => p.quote)),
+    actualBytesPerSecond: [...new Set(serving.map(p => p.sellerId))].reduce((sum, id) => sum + (sellerSpeed(s, id) ?? 0), 0),
+    sustainableBytesPerSecond: [...new Set(active.map(p => p.sellerId))].reduce((sum, id) => sum + (sellerSpeed(s, id) ?? 0), 0),
     facts: {
       eligible: eligibleIds.size, aboveCeiling, measured,
       unmeasuredEligible, zeroSpeed, blacklisted, inFlight: requests.length,
