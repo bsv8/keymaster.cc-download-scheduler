@@ -1,10 +1,10 @@
 # keymaster-trade-scheduler
 
-TypeScript 文件采购策略器，唯一源码位于本仓 `src/`；钱包消费本包，不保留内置副本。运行时零依赖，不访问真实时钟、网络、钱包或数据库，不执行签名和广播。Go 唯一实现位于本仓 `go/scheduler/`，module `github.com/bsv8/keymaster.cc-download-scheduler`；CLI 消费该模块，不保留内部副本。两语言遵循同一 TS 业务规则，不允许独立演进。
+TypeScript 文件采购策略器，唯一源码位于本仓 `src/`；钱包消费本包，不保留内置副本。运行时零依赖，不访问真实时钟、网络、钱包或数据库，不执行签名和广播。Go 唯一实现位于本仓根目录 `scheduler/`，`go.mod` 位于仓库根目录，module `github.com/bsv8/keymaster.cc-download-scheduler`；CLI 消费该模块，不保留内部副本。两语言遵循同一 TS 业务规则，不允许独立演进。
 
 ## 构建与使用
 
-Node.js 22、TypeScript 5.9。本仓运行 `pnpm install && pnpm build`，或使用 TypeScript 编译器执行 `tsc -p tsconfig.json`，输出到 `dist/`；消费前先构建，包导出仅指向 `dist/`。cc 当前通过本地 `file:` 依赖安装构建产物，不访问本仓源码。Go 在 `go/` 运行 `go build ./...`，仅依赖标准库；CLI 当前以本地 `replace` 引入，构建不依赖 Node.js。
+Node.js 22、TypeScript 5.9。本仓运行 `pnpm install && pnpm build`，或使用 TypeScript 编译器执行 `tsc -p tsconfig.json`，输出到 `dist/`；消费前先构建，包导出仅指向 `dist/`。cc 使用已发布的精确 npm 版本 `keymaster-trade-scheduler@0.1.0`，不使用本地 `file:` 或源码 alias；Go 目录整理不改变 npm 包。Go 在仓库根目录运行 `go build ./...`，仅依赖标准库；Go 使用根标签 `v0.1.1` 发布，不使用 `go/v...`；导入 `github.com/bsv8/keymaster.cc-download-scheduler/scheduler`，构建不依赖 Node.js。
 
 ```ts
 import { createTask, step, restoreTask } from 'keymaster-trade-scheduler';
@@ -62,6 +62,6 @@ node test/shared/download-scheduler/run.mjs --simulate --profile market --seed 3
 SCHEDULER_SEEDS=100 node test/keymaster.cc-cli/scheduler/run.mjs
 ```
 
-`npm run test:components:parity` 是工程仓的双组件统一门禁，检查 CLI 实际使用独立 Go 模块及内部副本不存在。调度器交叉测试逐步比较完整状态、命令、视图、唤醒和完整错误文本，拒绝事件不得修改输入；还将双方快照交换后续跑，与原轨迹逐步比较，不只各自恢复自己的快照。
+`npm run test:components:parity` 是工程仓的双组件开发源码交叉门禁，不代替发布版验收；`npm run test:components:released` 检查真实产品的发布依赖和 CLI 编译。调度器交叉测试逐步比较完整状态、命令、视图、唤醒和完整错误文本，拒绝事件不得修改输入；还将双方快照交换后续跑，与原轨迹逐步比较，不只各自恢复自己的快照。
 
 独立模型测试不等于真实钱包、协议和链上集成通过，也不是所有输入的穷尽证明。当前能力及执行层边界见工程仓库 `docs/shared/download-scheduler/当前实现.md`。
