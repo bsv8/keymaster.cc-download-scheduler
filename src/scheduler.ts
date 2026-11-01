@@ -1,3 +1,4 @@
+import { debugEnabled, debugLog } from "./debug.js";
 import { availableContent, hasArchive, pendingContent, recommendations, seatCap, sellerSpeed, unmeasuredCap, validQuotes, view } from "./recommend.js";
 import { identity, integer, price, reserve, sats, validateFees, validateQuote } from "./math.js";
 import { addContent, assertRequestPrices, recordFailedAttempt, reduce } from "./reducer.js";
@@ -352,6 +353,18 @@ export function nextWakeAt(s: State): number | null {
 }
 
 export function step(previous: State, event: Event): Result {
+  if (!debugEnabled()) return stepKernel(previous, event);
+  debugLog("operation.start", () => ({ operation: "step", input: event, state: previous }));
+  try {
+    const result = stepKernel(previous, event);
+    debugLog("operation.finish", () => ({ operation: "step", result }));
+    return result;
+  } catch (error) {
+    debugLog("operation.rejected", () => ({ operation: "step", reason: error instanceof Error ? error.message : String(error) }));
+    throw error;
+  }
+}
+function stepKernel(previous: State, event: Event): Result {
   identity(event.eventId);
   if (event.taskId !== previous.taskId || !event.eventId) throw new Error("Wrong task event");
   integer(event.receivedAt); integer(event.occurredAt);

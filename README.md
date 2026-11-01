@@ -29,6 +29,14 @@ const restored = restoreTask(JSON.parse(JSON.stringify(state)));
 
 金额是规范十进制整数 sats 字符串；速度为 bytes/s；时间由宿主注入。`step` 不修改输入，返回 `state / commands / view / nextWakeAt`。宿主原子保存状态和命令 outbox，之后按 `commandId` 幂等执行，并输入经过验证的结果。
 
+## 可选诊断（当前源码）
+
+TS `setDebugSink(sink)` / `debugEnabled()`，Go `SetDebugSink(sink)` / `DebugEnabled()`；默认关闭，由宿主在 dev 模式显式连接自己的日志出口。组件不读环境、时钟或磁盘，不依赖 BitFS；时间戳、序号和运行实例由宿主补充。事件统一为 `{component, event, details}`，component=`trade-scheduler`。
+
+每次 step 记录 `operation.start` 的输入事件与原状态，成功时 `operation.finish` 记录新状态、命令、view 和 nextWakeAt；`operation.rejected` 记录拒绝原因。状态包含报价/费用、卖家累计速度、席位、planned/pending/unresolved 请求、池容量/占用、资金、failure 和理由，可追踪为何不再新增工作、为何输出开池/购买/关闭命令。step 输出是候选决策，宿主原子落盘后才可称持久成功。
+
+sink 异常不能改变决策，输入/输出经分离脱敏，不输出秘密、正文、原始交易或签名；二进制仅 byteLength。日志不是恢复事实或业务输入，关闭时不计算日志摘要。
+
 ## 策略
 
 - 最高完整块价决定准入；上限内速度优先，不选择便宜卖家弥补资金不足，不提供价格偏好、任务总支出授权或自动价格建议。

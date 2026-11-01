@@ -188,6 +188,7 @@ func RestoreTask(snapshot State) (state State, err error) {
 }
 
 func Step(previous State, event Event) (result Result, err error) {
+	defer debugStep(previous, event, &result, &err)()
 	defer recoverTo(&err)
 	identity(event.EventID)
 	if event.TaskID != previous.TaskID || event.EventID == "" {
