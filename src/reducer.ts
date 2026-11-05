@@ -81,10 +81,6 @@ export function reduce(s: State, e: Event) {
       identity(e.sellerId);
       ensureSeller(s, e.sellerId, false).online = e.online; break;
     }
-    case "wallet":
-      integer(e.revision); sats(e.available);
-      if (e.revision > s.wallet.revision) s.wallet = { revision: e.revision, available: e.available, reflectedCommands: [...e.reflectedCommands] };
-      break;
     case "fees": {
       validateFees(e.fees);
       const pool = s.pools[e.poolId];
@@ -106,7 +102,7 @@ export function reduce(s: State, e: Event) {
         openingFee: "0", fees: { ...e.fees }, amount: e.amount, committed: e.committed,
         blockCapacity: 0, purchasedBlocks: 0, funding: "open", scheduling: "idle",
         openCommandId: "", closeCommandId: null, requestId: null, drainReason: null,
-        returned: null, refundAvailable: false, openingObserved: true, walletRevisionAtIntent: s.wallet.revision };
+        returned: null, refundAvailable: false, openingObserved: true };
       break;
     }
     case "opened": {
@@ -125,6 +121,7 @@ export function reduce(s: State, e: Event) {
       if (!p || p.openCommandId !== e.commandId) throw new Error("Uncorrelated failure");
       if (p.openingObserved || !["opening", "problem"].includes(p.funding)) break;
       p.funding = e.released ? "failed" : "problem";
+      if (e.insufficientFunds) s.failure ??= {code: "insufficient-funds", sellerId: p.sellerId, required: String(sats(p.amount) + sats(p.openingFee))};
       const work = p.requestId ? s.requests[p.requestId] : undefined;
       // 开池未知没有发出内容授权，计划工作可以解除，资金责任仍保留。
       if (work?.state === "planned") { work.state = "rejected"; p.requestId = null; }

@@ -76,35 +76,33 @@ type PoolScheduling = string
 
 // Pool is one seller's fee pool.
 type Pool struct {
-	ID                     string         `json:"id"`
-	TaskID                 string         `json:"taskId"`
-	SellerID               string         `json:"sellerId"`
-	SessionID              string         `json:"sessionId"`
-	Quote                  *Quote         `json:"quote,omitempty"`
-	OpeningFee             Sats           `json:"openingFee"`
-	Fees                   Fees           `json:"fees"`
-	Amount                 Sats           `json:"amount"`
-	Committed              Sats           `json:"committed"`
-	BlockCapacity          int64          `json:"blockCapacity"`
-	PurchasedBlocks        int64          `json:"purchasedBlocks"`
-	Funding                PoolFunding    `json:"funding"`
-	Scheduling             PoolScheduling `json:"scheduling"`
-	OpenCommandID          string         `json:"openCommandId"`
-	CloseCommandID         *string        `json:"closeCommandId"`
-	RequestID              *string        `json:"requestId"`
-	DrainReason            *string        `json:"drainReason"`
-	Returned               *Sats          `json:"returned"`
-	RefundAvailable        bool           `json:"refundAvailable"`
-	OpeningObserved        bool           `json:"openingObserved"`
-	WalletRevisionAtIntent int64          `json:"walletRevisionAtIntent"`
+	ID              string         `json:"id"`
+	TaskID          string         `json:"taskId"`
+	SellerID        string         `json:"sellerId"`
+	SessionID       string         `json:"sessionId"`
+	Quote           *Quote         `json:"quote,omitempty"`
+	OpeningFee      Sats           `json:"openingFee"`
+	Fees            Fees           `json:"fees"`
+	Amount          Sats           `json:"amount"`
+	Committed       Sats           `json:"committed"`
+	BlockCapacity   int64          `json:"blockCapacity"`
+	PurchasedBlocks int64          `json:"purchasedBlocks"`
+	Funding         PoolFunding    `json:"funding"`
+	Scheduling      PoolScheduling `json:"scheduling"`
+	OpenCommandID   string         `json:"openCommandId"`
+	CloseCommandID  *string        `json:"closeCommandId"`
+	RequestID       *string        `json:"requestId"`
+	DrainReason     *string        `json:"drainReason"`
+	Returned        *Sats          `json:"returned"`
+	RefundAvailable bool           `json:"refundAvailable"`
+	OpeningObserved bool           `json:"openingObserved"`
 }
 
 // TaskFailure is terminal for new work; existing obligations still settle.
 type TaskFailure struct {
-	Code      string `json:"code"`
-	SellerID  string `json:"sellerId"`
-	Required  Sats   `json:"required"`
-	Available Sats   `json:"available"`
+	Code     string `json:"code"`
+	SellerID string `json:"sellerId"`
+	Required Sats   `json:"required"`
 }
 
 // Request is one planned or dispatched content request.
@@ -119,13 +117,6 @@ type Request struct {
 	LastProgressAt   int64           `json:"lastProgressAt"`
 	TransferredBytes int64           `json:"transferredBytes"`
 	State            string          `json:"state"`
-}
-
-// Wallet is the host wallet snapshot.
-type Wallet struct {
-	Revision          int64    `json:"revision"`
-	Available         Sats     `json:"available"`
-	ReflectedCommands []string `json:"reflectedCommands"`
 }
 
 // QuoteDiscovery 是报价查询端口事实与唯一查询意图；没有报价不循环重试。
@@ -157,7 +148,6 @@ type State struct {
 	Sellers        map[string]*Seller  `json:"sellers"`
 	Pools          map[string]*Pool    `json:"pools"`
 	Requests       map[string]*Request `json:"requests"`
-	Wallet         Wallet              `json:"wallet"`
 	Spent          Sats                `json:"spent"`
 	SeenEvents     map[string]bool     `json:"seenEvents"`
 }
@@ -177,9 +167,7 @@ type Event struct {
 	SellerID          string    `json:"sellerId,omitempty"`
 	Online            *bool     `json:"online,omitempty"`
 	Enabled           *bool     `json:"enabled,omitempty"`
-	Revision          *int64    `json:"revision,omitempty"`
-	Available         string    `json:"available,omitempty"`
-	ReflectedCommands []string  `json:"reflectedCommands,omitempty"`
+	InsufficientFunds bool      `json:"insufficientFunds,omitempty"`
 	PoolID            string    `json:"poolId,omitempty"`
 	SessionID         string    `json:"sessionId,omitempty"`
 	Amount            Sats      `json:"amount,omitempty"`
@@ -211,23 +199,22 @@ type Command struct {
 	Reason    string `json:"reason"`
 	Type      string `json:"type"`
 
-	PoolID         string          `json:"poolId,omitempty"`
-	SellerID       string          `json:"sellerId,omitempty"`
-	SessionID      string          `json:"sessionId,omitempty"`
-	Quote          *Quote          `json:"quote,omitempty"`
-	Amount         string          `json:"amount,omitempty"`
-	ContentBudget  string          `json:"contentBudget,omitempty"`
-	Reserve        string          `json:"reserve,omitempty"`
-	OpeningFee     string          `json:"openingFee,omitempty"`
-	WalletRevision *int64          `json:"walletRevision,omitempty"`
-	BlockCapacity  *int64          `json:"blockCapacity,omitempty"`
-	RequestID      string          `json:"requestId,omitempty"`
-	ContentIDs     []string        `json:"contentIds,omitempty"`
-	Prices         map[string]Sats `json:"prices,omitempty"`
-	MaxPayment     string          `json:"maxPayment,omitempty"`
-	PriceLimit     string          `json:"priceLimit,omitempty"`
-	FeeVersion     *int64          `json:"feeVersion,omitempty"`
-	Committed      string          `json:"committed,omitempty"`
+	PoolID        string          `json:"poolId,omitempty"`
+	SellerID      string          `json:"sellerId,omitempty"`
+	SessionID     string          `json:"sessionId,omitempty"`
+	Quote         *Quote          `json:"quote,omitempty"`
+	Amount        string          `json:"amount,omitempty"`
+	ContentBudget string          `json:"contentBudget,omitempty"`
+	Reserve       string          `json:"reserve,omitempty"`
+	OpeningFee    string          `json:"openingFee,omitempty"`
+	BlockCapacity *int64          `json:"blockCapacity,omitempty"`
+	RequestID     string          `json:"requestId,omitempty"`
+	ContentIDs    []string        `json:"contentIds,omitempty"`
+	Prices        map[string]Sats `json:"prices,omitempty"`
+	MaxPayment    string          `json:"maxPayment,omitempty"`
+	PriceLimit    string          `json:"priceLimit,omitempty"`
+	FeeVersion    *int64          `json:"feeVersion,omitempty"`
+	Committed     string          `json:"committed,omitempty"`
 }
 
 // SliderView is the price slider projection.

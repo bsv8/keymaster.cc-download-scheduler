@@ -20,7 +20,7 @@ export function createTask(input: {
     config: clone(input.config), intent: "ready",
     failure: null, price: { mode: "auto", manualValue: null }, seats: [],
     manifestKnown: input.manifestKnown, content: {}, completed: {}, sellers: {}, pools: {}, requests: {},
-    wallet: { revision: -1, available: "0", reflectedCommands: [] }, spent: "0", seenEvents: {},
+    spent: "0", seenEvents: {},
   };
   addContent(state, input.content, input.reused);
   return state;
@@ -29,6 +29,10 @@ export function createTask(input: {
 /** 显式恢复快照；重放输入不会重新发出已经持久化的执行意图。 */
 export function restoreTask(snapshot: State): State {
   const s = clone(snapshot);
+  // Persisted protocol/work responsibility survives, obsolete wallet hints do not.
+  delete (s as State & {wallet?: unknown}).wallet;
+  for (const pool of Object.values(s.pools ?? {})) delete (pool as Pool & {walletRevisionAtIntent?: unknown}).walletRevisionAtIntent;
+  if (s.failure) delete (s.failure as NonNullable<State["failure"]> & {available?: unknown}).available;
   if (s.version !== 1 || !s.taskId || !s.seedHash) throw new Error("Unsupported task snapshot");
   validateConfig(s.config); integer(s.now); integer(s.revision); integer(s.sequence);
   s.failure ??= null;
@@ -40,10 +44,10 @@ export function restoreTask(snapshot: State): State {
   }
   identity(s.taskId); identity(s.seedHash);
   if (!["ready", "run", "pause", "cancel"].includes(s.intent)) throw new Error("Invalid snapshot intent");
-  sats(s.spent); sats(s.wallet.available);
+  sats(s.spent);
   if (s.failure !== null) {
     if (s.failure.code !== "insufficient-funds" || !s.sellers[s.failure.sellerId]) throw new Error("Invalid task failure");
-    sats(s.failure.required); sats(s.failure.available);
+    sats(s.failure.required);
   }
   if (!s.price || !["auto", "manual"].includes(s.price.mode)) throw new Error("Invalid snapshot slider");
   if (s.price.manualValue !== null) sats(s.price.manualValue);
@@ -112,13 +116,6 @@ function drain(s: State, p: Pool, commands: Command[], reason: string) {
   p.scheduling = "draining"; p.drainReason = reason;
   commands.push({ ...base(s, reason), type: "drain", poolId: p.id });
 }
-function walletFree(s: State): bigint {
-  // 无关的钱包修订号更新，不能证明本地资金占用已反映到快照。
-  const unreflected = Object.values(s.pools).filter(p => p.openCommandId && p.funding !== "failed"
-    && !s.wallet.reflectedCommands.includes(p.openCommandId))
-    .reduce((n, p) => n + sats(p.amount) + sats(p.openingFee), 0n);
-  return sats(s.wallet.available) - unreflected;
-}
 /** 确定性伪随机：同一状态与候选集合在重放中必然选中同一卖家。 */function pickRandom(s: State, ids: string[]): string {
   const sorted = [...ids].sort();
   let h = 2166136261;
@@ -174,11 +171,6 @@ function reviewSeats(s: State, drained: Set<string>, desired: Set<string>, quali
       desired.delete(drainSeller); desired.add(pickRandom(s, unmeasuredIdle)); continue;
     }
   }
-}
-
-/** 连一块及其完整费用也无法支付即终态失败；不换便宜卖家、不等待回款。 */
-function failFunds(s: State, sellerId: string, required: bigint, available: bigint) {
-  s.failure ??= { code: "insufficient-funds", sellerId, required: String(required), available: String(available > 0n ? available : 0n) };
 }
 
 function contentCost(q: Quote, items: Content[]): bigint {
@@ -286,16 +278,8 @@ function plan(s: State, reviewedSeller?: string): Command[] {
       if (affordable.length) items = affordable;
       else { drain(s, p, commands, "pool-exhausted"); p = undefined; }
     }
-    if (!p) {
-      // 同卖家旧池仍在关，不借预计回款；若已有其他实际钱包资金则允许准备工作。
-      const free = walletFree(s);
-      const minimum = price(q, items[0]) + reserve(q.fees, 1) + sats(q.fees.opening);
-      while (items.length && contentCost(q, items) + reserve(q.fees, items.length) + sats(q.fees.opening) > free) items.pop();
-      if (!items.length) {
-        failFunds(s, id, minimum, free);
-        break;
-      }
-    }
+    // New funding is demand-driven. Only the wallet manager can reject it
+    // for insufficient funds; never shrink work to consume the remaining balance.
     const requestId = nextId(s, "request");
     const poolId = p?.id ?? nextId(s, "pool");
     const prices = Object.fromEntries(items.map(item => [item.id, String(price(q, item))]));
@@ -310,13 +294,13 @@ function plan(s: State, reviewedSeller?: string): Command[] {
     const command: Command = { ...base(s, "work-assigned"), type: "open", poolId,
       sellerId: id, sessionId: q.sessionId, quote: clone(q), amount: String(budget + reserved),
       contentBudget: String(budget), reserve: String(reserved), openingFee: q.fees.opening,
-      walletRevision: s.wallet.revision, blockCapacity: count, requestId, contentIds: [...work.contentIds] };
+      blockCapacity: count, requestId, contentIds: [...work.contentIds] };
     work.commandId = command.commandId;
     s.pools[poolId] = { id: poolId, taskId: s.taskId, sellerId: id, sessionId: q.sessionId,
       quote: clone(q), openingFee: q.fees.opening, fees: clone(q.fees), amount: command.amount, committed: "0", blockCapacity: count, purchasedBlocks: 0,
       funding: "opening", scheduling: "idle", openCommandId: command.commandId,
       closeCommandId: null, requestId, drainReason: null, returned: null, refundAvailable: false,
-      openingObserved: false, walletRevisionAtIntent: s.wallet.revision };
+      openingObserved: false };
     commands.push(command);
   }
 

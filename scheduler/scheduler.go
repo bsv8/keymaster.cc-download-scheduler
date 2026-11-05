@@ -29,7 +29,7 @@ func CreateTask(input CreateInput) (state State, err error) {
 	state = State{Version: 1, TaskID: input.TaskID, SeedHash: input.SeedHash, Config: input.Config, Intent: "ready",
 		Price: Slider{Mode: "auto"}, Seats: []string{}, ManifestKnown: input.ManifestKnown, Content: newContentStore(),
 		Completed: map[string]string{}, Sellers: map[string]*Seller{}, Pools: map[string]*Pool{}, Requests: map[string]*Request{},
-		Wallet: Wallet{Revision: -1, Available: "0", ReflectedCommands: []string{}}, Spent: "0", SeenEvents: map[string]bool{}}
+		Spent: "0", SeenEvents: map[string]bool{}}
 	addContent(&state, input.Content, input.Reused)
 	return state, nil
 }
@@ -54,7 +54,6 @@ func RestoreTask(snapshot State) (state State, err error) {
 		fail("Invalid snapshot intent")
 	}
 	sats(s.Spent)
-	sats(s.Wallet.Available)
 	if s.QuoteDiscovery != nil && s.QuoteDiscovery.PendingCommandID != nil {
 		identity(*s.QuoteDiscovery.PendingCommandID)
 	}
@@ -63,7 +62,6 @@ func RestoreTask(snapshot State) (state State, err error) {
 			fail("Invalid task failure")
 		}
 		sats(s.Failure.Required)
-		sats(s.Failure.Available)
 	}
 	if s.Price.Mode != "auto" && s.Price.Mode != "manual" {
 		fail("Invalid snapshot slider")
@@ -261,16 +259,6 @@ func workCost(q Quote, items []Content) *big.Int {
 }
 func workRequired(q Quote, fees Fees, items []Content) *big.Int {
 	return new(big.Int).Add(workCost(q, items), reserve(fees, int64(len(items))))
-}
-func failFunds(s *State, id string, required, available *big.Int) {
-	if s.Failure != nil {
-		return
-	}
-	free := new(big.Int).Set(available)
-	if free.Sign() < 0 {
-		free.SetInt64(0)
-	}
-	s.Failure = &TaskFailure{Code: "insufficient-funds", SellerID: id, Required: required.String(), Available: free.String()}
 }
 func dispatchWork(s *State, p *Pool, r *Request, commands *[]Command) {
 	r.State = "pending"
@@ -530,18 +518,6 @@ func plan(s *State, reviewed string) []Command {
 					p = nil
 				}
 			}
-			if p == nil {
-				free := walletFree(s)
-				minimum := new(big.Int).Add(price(*q, items[0]), reserve(q.Fees, 1))
-				minimum.Add(minimum, sats(q.Fees.Opening))
-				for len(items) > 0 && new(big.Int).Add(workRequired(*q, q.Fees, items), sats(q.Fees.Opening)).Cmp(free) > 0 {
-					items = items[:len(items)-1]
-				}
-				if len(items) == 0 {
-					failFunds(s, id, minimum, free)
-					break
-				}
-			}
 			requestID := nextID(s, "request")
 			poolID := ""
 			if p != nil {
@@ -579,14 +555,12 @@ func plan(s *State, reviewed string) []Command {
 			c.ContentBudget = budget.String()
 			c.Reserve = reserved.String()
 			c.OpeningFee = q.Fees.Opening
-			rev := s.Wallet.Revision
-			c.WalletRevision = &rev
 			c.BlockCapacity = &count
 			c.RequestID = requestID
 			c.ContentIDs = append([]string{}, contentIDs...)
 			r.CommandID = c.CommandID
 			s.Pools[poolID] = &Pool{ID: poolID, TaskID: s.TaskID, SellerID: id, SessionID: q.SessionID, Quote: &qc, OpeningFee: q.Fees.Opening, Fees: q.Fees, Amount: c.Amount, Committed: "0", BlockCapacity: count,
-				Funding: "opening", Scheduling: "idle", OpenCommandID: c.CommandID, RequestID: &r.ID, WalletRevisionAtIntent: s.Wallet.Revision}
+				Funding: "opening", Scheduling: "idle", OpenCommandID: c.CommandID, RequestID: &r.ID}
 			commands = append(commands, c)
 		}
 	}
@@ -657,15 +631,6 @@ func drain(s *State, p *Pool, commands *[]Command, reason string) {
 	c.Type = "drain"
 	c.PoolID = p.ID
 	*commands = append(*commands, c)
-}
-func walletFree(s *State) *big.Int {
-	free := sats(s.Wallet.Available)
-	for _, p := range s.Pools {
-		if p.OpenCommandID != "" && p.Funding != "failed" && !containsString(s.Wallet.ReflectedCommands, p.OpenCommandID) {
-			free.Sub(free, new(big.Int).Add(sats(p.Amount), sats(p.OpeningFee)))
-		}
-	}
-	return free
 }
 func hasInFlight(s *State, id string) bool {
 	for _, p := range sortedPools(s) {

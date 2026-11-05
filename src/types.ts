@@ -60,8 +60,6 @@ export interface Pool {
   openCommandId: string; closeCommandId: string | null;
   requestId: string | null; drainReason: string | null;
   returned: Sats | null; refundAvailable: boolean; openingObserved: boolean;
-  /** 责任持续占用，直到明确的执行结果允许释放。 */
-  walletRevisionAtIntent: number;
 }
 export interface Request {
   id: string; commandId: string; poolId: string; contentIds: string[];
@@ -74,7 +72,7 @@ export interface State {
   version: 1; taskId: string; seedHash: string; revision: number; sequence: number; now: number;
   config: Config; intent: "ready" | "run" | "pause" | "cancel";
   /** 终态错误：停止新增工作，但在途和资金责任继续处理。 */
-  failure: { code: "insufficient-funds"; sellerId: string; required: Sats; available: Sats } | null;
+  failure: { code: "insufficient-funds"; sellerId: string; required: Sats } | null;
   /** 宿主是否具备报价查询端口；只由策略发 discover，不在宿主按池寿命重查。
    * 一次查询没有可用报价时不循环重试；新可用报价或显式 resume 才允许下一次。 */
   quoteDiscovery?: { enabled: boolean; armed: boolean; requested: boolean; failed: boolean; pendingCommandId: string | null };
@@ -84,7 +82,6 @@ export interface State {
   manifestKnown: boolean; content: Record<string, Content>;
   completed: Record<string, "reused" | "purchased">;
   sellers: Record<string, Seller>; pools: Record<string, Pool>; requests: Record<string, Request>;
-  wallet: { revision: number; available: Sats; reflectedCommands: string[] };
   spent: Sats; seenEvents: Record<string, true>;
 }
 export type Payload =
@@ -97,12 +94,11 @@ export type Payload =
   | { type: "quote-source"; enabled: boolean }
   | { type: "quotes-requested" | "quotes-request-failed"; commandId: string }
   | { type: "seller"; sellerId: string; online: boolean }
-  | { type: "wallet"; revision: number; available: Sats; reflectedCommands: string[] }
   | { type: "fees"; poolId: string; fees: Fees }
   /** 宿主验证后的既存池事实，不要求文件或开池报价。 */
   | { type: "pool-available"; poolId: string; sellerId: string; sessionId: string; amount: Sats; committed: Sats; fees: Fees }
   | { type: "opened"; poolId: string; commandId: string }
-  | { type: "open-failed"; poolId: string; commandId: string; released: boolean }
+  | { type: "open-failed"; poolId: string; commandId: string; released: boolean; insufficientFunds?: boolean }
   | { type: "unknown"; poolId: string; commandId: string }
   | { type: "progress"; requestId: string; bytes: number }
   /** 可信执行结果：接受的内容必须已验收，且付款责任已对清。 */
@@ -119,7 +115,7 @@ export interface CommandBase {
 export type Command = CommandBase & (
   | { type: "discover" }
   | { type: "open"; poolId: string; sellerId: string; sessionId: string; quote: Quote;
-      amount: Sats; contentBudget: Sats; reserve: Sats; openingFee: Sats; walletRevision: number; blockCapacity: number; requestId: string; contentIds: string[] }
+      amount: Sats; contentBudget: Sats; reserve: Sats; openingFee: Sats; blockCapacity: number; requestId: string; contentIds: string[] }
   | { type: "download"; poolId: string; requestId: string; quote: Quote; contentIds: string[];
       prices: Record<string, Sats>; maxPayment: Sats; priceLimit: Sats; feeVersion: number }
   | { type: "drain"; poolId: string }

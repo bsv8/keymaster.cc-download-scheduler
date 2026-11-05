@@ -151,19 +151,6 @@ func reduce(s *State, event Event) {
 	case "seller":
 		identity(event.SellerID)
 		ensureSeller(s, event.SellerID, false).Online = boolValue(event.Online)
-	case "wallet":
-		if event.Revision == nil {
-			fail("Invalid integer quantity")
-		}
-		integer(*event.Revision, 0)
-		sats(event.Available)
-		if *event.Revision > s.Wallet.Revision {
-			s.Wallet = Wallet{
-				Revision:          *event.Revision,
-				Available:         event.Available,
-				ReflectedCommands: append([]string{}, event.ReflectedCommands...),
-			}
-		}
 	case "fees":
 		if event.Fees == nil {
 			fail("invalid fee contract")
@@ -198,7 +185,7 @@ func reduce(s *State, event Event) {
 		ensureSeller(s, event.SellerID, true)
 		s.Pools[event.PoolID] = &Pool{ID: event.PoolID, TaskID: s.TaskID, SellerID: event.SellerID, SessionID: event.SessionID,
 			OpeningFee: "0", Fees: *event.Fees, Amount: event.Amount, Committed: event.Committed, Funding: "open", Scheduling: "idle",
-			OpeningObserved: true, WalletRevisionAtIntent: s.Wallet.Revision}
+			OpeningObserved: true}
 	case "opened":
 		pool := s.Pools[event.PoolID]
 		if pool == nil || pool.OpenCommandID != event.CommandID {
@@ -227,6 +214,9 @@ func reduce(s *State, event Event) {
 			pool.Funding = "failed"
 		} else {
 			pool.Funding = "problem"
+		}
+		if event.InsufficientFunds && s.Failure == nil {
+			s.Failure = &TaskFailure{Code: "insufficient-funds", SellerID: pool.SellerID, Required: addSats(pool.Amount, pool.OpeningFee)}
 		}
 		if pool.RequestID != nil {
 			work := s.Requests[*pool.RequestID]
