@@ -22,40 +22,61 @@ func recordFailedAttempt(seller *Seller, bytes, startedAt, at int64) {
 	seller.LastAt = &at
 }
 
-func addContent(s *State, content []Content, reused []string) {
-	for _, item := range content {
-		identity(item.ID)
-		if item.Kind != "seed" && item.Kind != "block" {
-			fail("Invalid content")
-		}
-		integer(item.Bytes, 1)
-		if previous, ok := s.Content.Get(item.ID); ok && (previous.Bytes != item.Bytes || previous.Kind != item.Kind) {
-			fail("Conflicting content identity")
-		}
-		s.Content.Set(item)
-	}
-	seedCount := 0
-	for _, item := range s.Content.Values() {
-		if item.Kind == "seed" {
-			seedCount++
-		}
-	}
-	if seedCount > 1 {
-		fail("Multiple Seed objects")
-	}
+// registerSeed records the seed content (no byte length); exactly one per task.
+func registerSeed(s *State) {
+	s.Content.Set(Content{ID: s.SeedHash, Kind: "seed"})
+}
+
+// markReused appends reused blocks; it never overwrites a purchase record and
+// never releases an outstanding claim. Already-purchased blocks keep purchased.
+func markReused(s *State, reused []string, blocks map[string]int64) {
+	seen := map[string]bool{}
+	unique := []string{}
 	for _, id := range reused {
-		if _, ok := s.Content.Get(id); !ok {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		unique = append(unique, id)
+	}
+	for _, id := range unique {
+		if _, ok := blocks[id]; !ok {
 			fail("Unknown reused content")
 		}
+	}
+	for _, id := range unique {
 		for _, request := range s.Requests {
 			if (request.State == "planned" || request.State == "pending" || request.State == "unresolved") && containsString(request.ContentIDs, id) {
 				fail("Reusing unresolved content")
 			}
 		}
+	}
+	for _, id := range unique {
+		if s.Completed[id] == "purchased" {
+			continue
+		}
 		if _, ok := s.Completed[id]; !ok {
 			s.Completed[id] = "reused"
 		}
 	}
+}
+
+// applyFileInfo registers the derived unique blocks, marks reused blocks and
+// records the manifest.
+func applyFileInfo(s *State, derived derivedFileInfo, reused []string) {
+	for _, id := range derived.order {
+		size := derived.blocks[id]
+		if old, ok := s.Content.Get(id); ok {
+			if old.Kind != "block" || old.Bytes == nil || *old.Bytes != size {
+				fail("Conflicting content identity")
+			}
+			continue
+		}
+		s.Content.Set(Content{ID: id, Kind: "block", Bytes: &size})
+	}
+	markReused(s, reused, derived.blocks)
+	manifest := cloneManifest(&derived.manifest)
+	s.Manifest = manifest
 }
 
 func containsString(values []string, target string) bool {
@@ -136,8 +157,23 @@ func reduce(s *State, event Event) {
 		}
 		s.Price.Mode = "auto"
 	case "manifest":
-		addContent(s, event.Content, event.Reused)
-		s.ManifestKnown = true
+		if event.FileBytes == nil || event.BlockBytes == nil || event.BlockHashes == nil {
+			fail("Invalid manifest")
+		}
+		derived, reused, ok := parseFileInfo(s.SeedHash, event.FileBytes, event.BlockBytes, event.BlockHashes, event.ReusedBlockHashes)
+		if !ok {
+			fail("Invalid manifest")
+		}
+		if s.Manifest != nil {
+			// The manifest (including order and duplicates) is immutable once
+			// known; identical re-deliveries may only append valid reused blocks.
+			if !sameManifest(s.Manifest, &derived.manifest) {
+				fail("Conflicting manifest")
+			}
+			markReused(s, reused, derived.blocks)
+			break
+		}
+		applyFileInfo(s, derived, reused)
 	case "quote":
 		if event.Quote == nil {
 			fail("invalid quote")
@@ -271,12 +307,19 @@ func reduce(s *State, event Event) {
 			fail("Invalid integer quantity")
 		}
 		integer(*event.Bytes, 0)
+		allKnown := true
 		var size int64
 		for _, id := range request.ContentIDs {
 			item, _ := s.Content.Get(id)
-			size += item.Bytes
+			if item.Bytes == nil {
+				allKnown = false
+				continue
+			}
+			size += *item.Bytes
 		}
-		if *event.Bytes > size {
+		// Seed bytes are unknown: only the upper-bound check is skipped;
+		// progress advance and stall detection still apply.
+		if allKnown && *event.Bytes > size {
 			fail("Impossible transfer progress")
 		}
 		if *event.Bytes > request.TransferredBytes {
@@ -341,7 +384,7 @@ func reduce(s *State, event Event) {
 		for _, id := range event.Accepted {
 			item, _ := s.Content.Get(id)
 			if item.Kind == "block" {
-				acceptedBytes += item.Bytes
+				acceptedBytes += contentBytesOf(item)
 			}
 		}
 		if len(event.Accepted) == 0 {

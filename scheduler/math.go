@@ -81,12 +81,13 @@ func price(quote Quote, content Content) *big.Int {
 	if content.Kind == "seed" {
 		return sats(quote.SeedPrice)
 	}
-	if content.Bytes < quote.BlockBytes && quote.TailPrice != nil {
+	bytes := contentBytesOf(content)
+	if bytes < quote.BlockBytes && quote.TailPrice != nil {
 		return sats(*quote.TailPrice)
 	}
 	// Quote declares a full block size; a tail block pays the byte ratio
 	// rounded up with integer arithmetic.
-	numerator := new(big.Int).Mul(sats(quote.BlockPrice), big.NewInt(content.Bytes))
+	numerator := new(big.Int).Mul(sats(quote.BlockPrice), big.NewInt(bytes))
 	denominator := big.NewInt(quote.BlockBytes)
 	numerator.Add(numerator, new(big.Int).Sub(denominator, big.NewInt(1)))
 	return numerator.Div(numerator, denominator)

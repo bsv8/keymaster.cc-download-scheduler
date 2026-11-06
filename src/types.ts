@@ -1,6 +1,19 @@
 /** 金额使用规范十进制聪字符串；快照不包含BigInt、时钟或资源句柄。 */
 export type Sats = string;
-export interface Content { id: string; kind: "seed" | "block"; bytes: number }
+/**
+ * 一个可计价的内容对象。
+ * Seed 不携带 `bytes`（Seed 大小未知，不做总量上限校验）；块由 `(索引, fileBytes, blockBytes)` 推导长度。
+ */
+export interface Content { id: string; kind: "seed" | "block"; bytes?: number }
+/** 文件结构：完整有序块哈希清单（含重复位置）。`null` 表示种子尚未知。 */
+export interface Manifest {
+  /** 原文件字节数；0 表示已知空文件。 */
+  fileBytes: number;
+  /** 标准块大小（字节），>= 1。 */
+  blockBytes: number;
+  /** 完整有序块哈希清单；空文件时为 []。 */
+  blockHashes: string[];
+}
 export interface Fees {
   version: number;
   opening: Sats;
@@ -79,7 +92,9 @@ export interface State {
   price: Slider;
   /** 当前持有席位的卖家；池关闭与重开之间保持，只在席位评审时变更。 */
   seats: string[];
-  manifestKnown: boolean; content: Record<string, Content>;
+  /** 文件结构；`null` 表示种子尚未知（等待 manifest 事件）。 */
+  manifest: Manifest | null;
+  content: Record<string, Content>;
   completed: Record<string, "reused" | "purchased">;
   sellers: Record<string, Seller>; pools: Record<string, Pool>; requests: Record<string, Request>;
   spent: Sats; seenEvents: Record<string, true>;
@@ -89,7 +104,7 @@ export type Payload =
   | { type: "limits"; maxBlockPrice?: Sats; baseSeats?: number; floatingSeats?: number }
   | { type: "slider"; slider: "price"; value: string }
   | { type: "automatic"; slider: "price" }
-  | { type: "manifest"; content: Content[]; reused?: string[] }
+  | { type: "manifest"; fileBytes: number; blockBytes: number; blockHashes: string[]; reusedBlockHashes?: string[] }
   | { type: "quote"; quote: Quote }
   | { type: "quote-source"; enabled: boolean }
   | { type: "quotes-requested" | "quotes-request-failed"; commandId: string }
@@ -156,3 +171,19 @@ export interface View {
   estimatedRemainingContent: { min: Sats; max: Sats } | null;
 }
 export interface Result { state: State; commands: Command[]; view: View; nextWakeAt: number | null }
+/**
+ * 创建任务输入。只提供 `seedHash` 时内核先购买 Seed；提供完整文件信息
+ * （`fileBytes/blockBytes/blockHashes` 三者同给）时内核认定宿主已验证本地 Seed，跳过购买。
+ */
+export interface CreateTaskInput {
+  taskId: string;
+  seedHash: string;
+  /** 原文件字节数；0 表示已知空文件。 */
+  fileBytes?: number;
+  /** 标准块大小（字节），>= 1。 */
+  blockBytes?: number;
+  /** 完整有序块哈希清单（含重复位置）；长度必须等于 ceil(fileBytes / blockBytes)。 */
+  blockHashes?: string[];
+  /** 宿主已按本地字节重验的块；只允许属于清单的块。 */
+  reusedBlockHashes?: string[];
+}

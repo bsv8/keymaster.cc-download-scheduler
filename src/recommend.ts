@@ -78,7 +78,7 @@ export function view(s: State): View {
   const pools = Object.values(s.pools);
   const live = pools.filter(p => !["closed", "failed", "problem"].includes(p.funding));
   const problem = pools.filter(p => p.funding === "problem");
-  const complete = s.manifestKnown && pendingContent(s).length === 0;
+  const complete = s.manifest !== null && pendingContent(s).length === 0;
   const requests = Object.values(s.requests).filter(r => r.state === "pending" || r.state === "unresolved");
   const serving = live.filter(p => p.funding === "open" && p.requestId && p.scheduling === "serving");
   const active = live.filter(p => p.funding === "open" && p.scheduling !== "draining" && p.scheduling !== "retired");
@@ -86,7 +86,7 @@ export function view(s: State): View {
   if (s.failure) reasons.push(s.failure.code);
   if (s.quoteDiscovery?.pendingCommandId) reasons.push("requesting-quotes");
   if (s.quoteDiscovery?.failed) reasons.push("quote-request-failed");
-  if (!s.manifestKnown) reasons.push("manifest-unknown");
+  if (s.manifest === null) reasons.push("manifest-unknown");
   if (problem.length) reasons.push("problem-pool");
   if (!rec.quotes.length && !complete) reasons.push("no-eligible-seller");
   if (rec.quotes.some(q => sellerSpeed(s, q.sellerId) === null)) reasons.push("speed-unmeasured");
@@ -121,7 +121,7 @@ export function view(s: State): View {
       : s.intent === "cancel" ? (requests.length ? "stopping" : "stopped")
       : s.intent === "pause" ? (requests.length ? "stopping" : "paused")
       : requests.length ? "running" : "waiting",
-    content: !s.manifestKnown ? "manifest-unknown" : complete ? "complete" : "incomplete",
+    content: s.manifest === null ? "manifest-unknown" : complete ? "complete" : "incomplete",
     funds: problem.length ? "problem"
       : live.length || pools.some(p => p.funding === "closed" && !p.refundAvailable) ? "pending"
       : pools.length ? "settled" : "none",
@@ -147,6 +147,6 @@ export function view(s: State): View {
         + sats(p.fees.arbitrationPerItem) * BigInt(p.requestId ? s.requests[p.requestId].contentIds.length : 1), 0n)),
       settlementReserved: String(live.reduce((n, p) => n + sats(p.fees.settlement), 0n)),
     },
-    estimatedRemainingContent: covered && s.manifestKnown ? { min: String(costMin), max: String(costMax) } : null,
+    estimatedRemainingContent: covered && s.manifest !== null ? { min: String(costMin), max: String(costMax) } : null,
   };
 }

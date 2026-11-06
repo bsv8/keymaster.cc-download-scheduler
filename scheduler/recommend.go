@@ -152,7 +152,7 @@ func view(s *State) View {
 			problem = append(problem, pool)
 		}
 	}
-	complete := s.ManifestKnown && len(pendingContent(s)) == 0
+	complete := s.Manifest != nil && len(pendingContent(s)) == 0
 	requests := make([]*Request, 0)
 	for _, request := range sortedRequests(s) {
 		if request.State == "pending" || request.State == "unresolved" {
@@ -181,7 +181,7 @@ func view(s *State) View {
 			reasons = append(reasons, "quote-request-failed")
 		}
 	}
-	if !s.ManifestKnown {
+	if s.Manifest == nil {
 		reasons = append(reasons, "manifest-unknown")
 	}
 	if len(problem) > 0 {
@@ -343,7 +343,7 @@ func view(s *State) View {
 		}
 	}
 	contentState := "incomplete"
-	if !s.ManifestKnown {
+	if s.Manifest == nil {
 		contentState = "manifest-unknown"
 	} else if complete {
 		contentState = "complete"
@@ -387,7 +387,7 @@ func view(s *State) View {
 		}
 	}
 	var estimate *EstimatedContent
-	if covered && s.ManifestKnown {
+	if covered && s.Manifest != nil {
 		estimate = &EstimatedContent{Min: costMin.String(), Max: costMax.String()}
 	}
 	return View{

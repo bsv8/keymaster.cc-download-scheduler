@@ -1,5 +1,6 @@
-import { identity, integer, price, sats, validateFees, validateQuote } from "./math.js";
-import type { Content, Event, Seller, State } from "./types.js";
+import { identity, integer, price, sats, validateFees, validateQuote, contentBytes } from "./math.js";
+import { deriveFileInfo, parseFileInfo, sameManifest } from "./manifest.js";
+import type { Event, Seller, State } from "./types.js";
 
 function ensureSeller(s: State, id: string, online: boolean): Seller {
   return s.sellers[id] ??= {
@@ -15,21 +16,43 @@ export function recordFailedAttempt(seller: Seller, bytes: number, startedAt: nu
   seller.measured = true; seller.lastAt = at;
 }
 
-export function addContent(s: State, content: Content[], reused: string[] = []) {
-  for (const c of content) {
-    identity(c.id);
-    if (!["seed", "block"].includes(c.kind)) throw new Error("Invalid content");
-    integer(c.bytes, 1);
-    const old = s.content[c.id];
-    if (old && (old.bytes !== c.bytes || old.kind !== c.kind)) throw new Error("Conflicting content identity");
-    s.content[c.id] = { ...c };
+/** 登记 Seed（无字节数）；每个任务恰好一个，id 等于 seedHash。 */
+export function registerSeed(s: State) {
+  s.content[s.seedHash] = { id: s.seedHash, kind: "seed" };
+}
+
+/**
+ * 追加复用块（可重复调用）：不能覆盖购买记录、不能解除未决认领。
+ * 已 purchased 的块保持 purchased；已 reused 的块不变。
+ */
+export function markReused(s: State, reused: string[], blocks: Map<string, number>) {
+  const unique = [...new Set(reused)];
+  for (const id of unique) {
+    if (!blocks.has(id)) throw new Error("Unknown reused content");
   }
-  if (Object.values(s.content).filter(c => c.kind === "seed").length > 1) throw new Error("Multiple Seed objects");
-  for (const id of reused) {
-    if (!s.content[id]) throw new Error("Unknown reused content");
-    if (Object.values(s.requests).some(r => ["planned", "pending", "unresolved"].includes(r.state) && r.contentIds.includes(id))) throw new Error("Reusing unresolved content");
+  for (const id of unique) {
+    if (Object.values(s.requests).some(r => ["planned", "pending", "unresolved"].includes(r.state) && r.contentIds.includes(id))) {
+      throw new Error("Reusing unresolved content");
+    }
+  }
+  for (const id of unique) {
+    if (s.completed[id] === "purchased") continue;
     s.completed[id] ??= "reused";
   }
+}
+
+/** 已校验的文件信息写入状态：登记唯一块、标记复用块、记录清单。 */
+export function applyFileInfo(s: State, derived: ReturnType<typeof deriveFileInfo>, reused: string[] = []) {
+  for (const [id, bytes] of derived.blocks) {
+    const old = s.content[id];
+    if (old) {
+      if (old.kind !== "block" || old.bytes !== bytes) throw new Error("Conflicting content identity");
+      continue;
+    }
+    s.content[id] = { id, kind: "block", bytes };
+  }
+  markReused(s, reused, derived.blocks);
+  s.manifest = { fileBytes: derived.manifest.fileBytes, blockBytes: derived.manifest.blockBytes, blockHashes: [...derived.manifest.blockHashes] };
 }
 
 export function reduce(s: State, e: Event) {
@@ -69,7 +92,19 @@ export function reduce(s: State, e: Event) {
     case "automatic":
       if (e.slider !== "price") throw new Error("Invalid slider");
       s.price.mode = "auto"; break;
-    case "manifest": addContent(s, e.content, e.reused); s.manifestKnown = true; break;
+    case "manifest": {
+      if (e.fileBytes === undefined || e.blockBytes === undefined || !Array.isArray(e.blockHashes)) throw new Error("Invalid manifest");
+      const parsed = parseFileInfo(s.seedHash, e);
+      if (!parsed) throw new Error("Invalid manifest");
+      if (s.manifest) {
+        // 清单（含顺序与重复次数）一旦确定不得变更；相同信息重复提供时只允许追加合法复用块。
+        if (!sameManifest(s.manifest, parsed.derived.manifest)) throw new Error("Conflicting manifest");
+        markReused(s, parsed.reused, parsed.derived.blocks);
+        break;
+      }
+      applyFileInfo(s, parsed.derived, parsed.reused);
+      break;
+    }
     case "quote": {
       validateQuote(e.quote);
       const q = e.quote;
@@ -146,8 +181,12 @@ export function reduce(s: State, e: Event) {
       const r = s.requests[e.requestId];
       if (!r || r.state !== "pending") break;
       integer(e.bytes);
-      const size = r.contentIds.reduce((n, id) => n + s.content[id].bytes, 0);
-      if (e.bytes > size) throw new Error("Impossible transfer progress");
+      const items = r.contentIds.map(id => s.content[id]);
+      // Seed 字节未知：只跳过上限校验，进度推进与停摆判定照旧。
+      if (items.every(item => item.bytes !== undefined)) {
+        const size = items.reduce((n, item) => n + contentBytes(item), 0);
+        if (e.bytes > size) throw new Error("Impossible transfer progress");
+      }
       if (e.bytes > r.transferredBytes) { r.transferredBytes = e.bytes; r.lastProgressAt = s.now; }
       break;
     }
@@ -171,7 +210,7 @@ export function reduce(s: State, e: Event) {
       r.state = "settled"; p.requestId = null;
       for (const id of e.accepted) s.completed[id] = "purchased";
       const seller = s.sellers[p.sellerId];
-      const bytes = e.accepted.filter(id => s.content[id].kind === "block").reduce((n, id) => n + s.content[id].bytes, 0);
+      const bytes = e.accepted.filter(id => s.content[id].kind === "block").reduce((n, id) => n + contentBytes(s.content[id]), 0);
       if (!e.accepted.length) {
         // 确定失败：验收为空（坏块 / 内容校验失败）→ 本任务立即拉黑该卖家。
         seller.blacklisted = true; seller.failureCount++;

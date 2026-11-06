@@ -11,26 +11,44 @@ import (
 	"unicode/utf16"
 )
 
-// CreateInput contains only explicit facts; the kernel has no I/O or defaults.
-type CreateInput struct {
-	TaskID        string    `json:"taskId"`
-	SeedHash      string    `json:"seedHash"`
-	Config        Config    `json:"config"`
-	Content       []Content `json:"content"`
-	ManifestKnown bool      `json:"manifestKnown"`
-	Reused        []string  `json:"reused"`
+// Scheduler holds one validated instance configuration; create multiple
+// tasks from it. No network, timer, persistence or auto-execution is added.
+type Scheduler struct {
+	config Config
 }
 
-func CreateTask(input CreateInput) (state State, err error) {
+// New validates the configuration and returns a download scheduler instance.
+func New(config Config) (*Scheduler, error) {
+	var err error
+	func() {
+		defer recoverTo(&err)
+		validateConfig(config)
+	}()
+	if err != nil {
+		return nil, err
+	}
+	return &Scheduler{config: config}, nil
+}
+
+// Config returns a copy of the frozen instance configuration.
+func (s *Scheduler) Config() Config { return s.config }
+
+// CreateTask builds a fresh task state from explicit facts only.
+func (s *Scheduler) CreateTask(input CreateTaskInput) (state State, err error) {
 	defer recoverTo(&err)
 	identity(input.TaskID)
 	identity(input.SeedHash)
-	validateConfig(input.Config)
-	state = State{Version: 1, TaskID: input.TaskID, SeedHash: input.SeedHash, Config: input.Config, Intent: "ready",
-		Price: Slider{Mode: "auto"}, Seats: []string{}, ManifestKnown: input.ManifestKnown, Content: newContentStore(),
+	derived, reused, ok := parseFileInfo(input.SeedHash, input.FileBytes, input.BlockBytes, input.BlockHashes, input.ReusedBlockHashes)
+	state = State{Version: 1, TaskID: input.TaskID, SeedHash: input.SeedHash, Config: s.config, Intent: "ready",
+		Price: Slider{Mode: "auto"}, Seats: []string{}, Content: newContentStore(),
 		Completed: map[string]string{}, Sellers: map[string]*Seller{}, Pools: map[string]*Pool{}, Requests: map[string]*Request{},
 		Spent: "0", SeenEvents: map[string]bool{}}
-	addContent(&state, input.Content, input.Reused)
+	registerSeed(&state)
+	if ok {
+		applyFileInfo(&state, derived, reused)
+		// Providing full file information asserts the local Seed is verified.
+		state.Completed[state.SeedHash] = "reused"
+	}
 	return state, nil
 }
 
@@ -81,12 +99,24 @@ func RestoreTask(snapshot State) (state State, err error) {
 			fail("Unknown seat seller")
 		}
 	}
+	var derivedManifest *derivedFileInfo
+	if s.Manifest != nil {
+		derived, derr := func() (d derivedFileInfo, err error) {
+			defer recoverTo(&err)
+			d = deriveFileInfo(s.SeedHash, s.Manifest.FileBytes, s.Manifest.BlockBytes, s.Manifest.BlockHashes)
+			return d, nil
+		}()
+		if derr != nil {
+			fail("Unsupported task snapshot")
+		}
+		derivedManifest = &derived
+	}
 	for _, item := range s.Content.Values() {
 		if item.ID == "" {
 			fail("Content key mismatch")
 		}
 	}
-	addContent(s, s.Content.Values(), nil)
+	validateRestoredContent(s, derivedManifest)
 	for id := range s.Completed {
 		if _, ok := s.Content.Get(id); !ok {
 			fail("Unknown completed content")
@@ -312,9 +342,9 @@ func plan(s *State, reviewed string) []Command {
 		s.QuoteDiscovery.Armed = true
 		s.QuoteDiscovery.Failed = false
 	}
-	complete := s.ManifestKnown && len(pendingContent(s)) == 0
+	complete := s.Manifest != nil && len(pendingContent(s)) == 0
 	enabled := s.Intent == "run" && s.Failure == nil && !complete
-	awaiting := !s.ManifestKnown && len(pendingContent(s)) == 0
+	awaiting := s.Manifest == nil && len(pendingContent(s)) == 0
 	qualified := []Quote{}
 	if enabled {
 		qualified = quotes

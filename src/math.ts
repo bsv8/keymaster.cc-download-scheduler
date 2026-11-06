@@ -1,5 +1,11 @@
 import type { Content, Fees, Quote, Sats } from "./types.js";
 
+/** 块的字节数；Seed 不携带 bytes，调用方只对块调用（缺失表示内部不变量被破坏）。 */
+export function contentBytes(content: Content): number {
+  if (content.bytes === undefined) throw new Error("Content bytes missing");
+  return content.bytes;
+}
+
 export function sats(value: Sats): bigint {
   if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value)) throw new Error("Invalid integer sats");
   return BigInt(value);
@@ -17,9 +23,10 @@ export function reserve(fees: Fees, count: number): bigint {
 }
 export function price(quote: Quote, content: Content): bigint {
   if (content.kind === "seed") return sats(quote.seedPrice);
-  if (content.bytes < quote.blockBytes && quote.tailPrice !== undefined) return sats(quote.tailPrice);
+  const bytes = contentBytes(content);
+  if (bytes < quote.blockBytes && quote.tailPrice !== undefined) return sats(quote.tailPrice);
   // 报价声明完整块大小；尾块按字节比例进行整数向上取整。
-  return (sats(quote.blockPrice) * BigInt(content.bytes) + BigInt(quote.blockBytes) - 1n) / BigInt(quote.blockBytes);
+  return (sats(quote.blockPrice) * BigInt(bytes) + BigInt(quote.blockBytes) - 1n) / BigInt(quote.blockBytes);
 }
 export function validateFees(f: Fees) {
   integer(f.version); sats(f.opening); sats(f.settlement); sats(f.arbitrationBase); sats(f.arbitrationPerItem);
