@@ -2,7 +2,7 @@ import { debugEnabled, debugLog } from "./debug.js";
 import { availableContent, hasArchive, pendingContent, recommendations, seatCap, sellerSpeed, unmeasuredCap, validQuotes, view } from "./recommend.js";
 import { identity, integer, price, reserve, sats, validateFees, validateQuote } from "./math.js";
 import { applyFileInfo, assertRequestPrices, recordFailedAttempt, reduce, registerSeed } from "./reducer.js";
-import { deriveFileInfo, parseFileInfo, type DerivedFileInfo } from "./manifest.js";
+import { deriveFileInfo, parseResume, tailBlockId, type DerivedFileInfo } from "./manifest.js";
 import type { Command, Config, Content, CreateTaskInput, Event, Pool, Quote, Result, State } from "./types.js";
 
 function clone<T>(value: T): T { return JSON.parse(JSON.stringify(value)) as T; }
@@ -15,37 +15,35 @@ function validateRestoredManifest(s: State): DerivedFileInfo | null {
   if (!("manifest" in s)) throw new Error("Unsupported task snapshot");
   if (s.manifest === null) return null;
   if (typeof s.manifest !== "object" || Array.isArray(s.manifest)) throw new Error("Unsupported task snapshot");
-  const extra = Object.keys(s.manifest).filter(key => !["fileBytes", "blockBytes", "blockHashes"].includes(key));
+  const extra = Object.keys(s.manifest).filter(key => !["blockHashes"].includes(key));
   if (extra.length) throw new Error("Unsupported task snapshot");
   try {
-    return deriveFileInfo(s.seedHash, s.manifest.fileBytes, s.manifest.blockBytes, s.manifest.blockHashes);
+    return deriveFileInfo(s.seedHash, s.manifest.blockHashes);
   } catch {
     throw new Error("Unsupported task snapshot");
   }
 }
 
-/** 恢复校验：恰好一个 Seed 且 id 等于 seedHash；块集合与清单推导完全一致。 */
+/** 恢复校验：恰好一个 Seed 且 id 等于 seedHash；块集合与清单去重集合完全一致。 */
 function validateRestoredContent(s: State, derived: DerivedFileInfo | null) {
   const entries = Object.values(s.content);
   const seeds = entries.filter(item => item.kind === "seed");
   if (seeds.length !== 1 || seeds[0]!.id !== s.seedHash) throw new Error("Unsupported task snapshot");
-  if (seeds[0]!.bytes !== undefined) throw new Error("Unsupported task snapshot");
-  const blocks = new Map<string, number>();
+  if ("bytes" in (seeds[0] as object)) throw new Error("Unsupported task snapshot");
+  const blocks = new Set<string>();
   for (const item of entries) {
     if (item.kind === "seed") continue;
     if (item.kind !== "block") throw new Error("Unsupported task snapshot");
-    if (item.bytes === undefined || !Number.isSafeInteger(item.bytes) || item.bytes < 1) throw new Error("Unsupported task snapshot");
-    blocks.set(item.id, item.bytes);
+    if ("bytes" in (item as object)) throw new Error("Unsupported task snapshot");
+    blocks.add(item.id);
   }
   if (!derived) {
     if (blocks.size !== 0) throw new Error("Unsupported task snapshot");
     return;
   }
   if (blocks.size !== derived.blocks.size) throw new Error("Content key mismatch");
-  for (const [id, bytes] of derived.blocks) {
-    const actual = blocks.get(id);
-    if (actual === undefined) throw new Error("Content key mismatch");
-    if (actual !== bytes) throw new Error("Conflicting content identity");
+  for (const id of derived.blocks) {
+    if (!blocks.has(id)) throw new Error("Content key mismatch");
   }
 }
 
@@ -66,11 +64,11 @@ export function createDownloadScheduler(config: Config): DownloadScheduler {
     config: defaults,
     createTask(input: CreateTaskInput): State {
       if (input === null || typeof input !== "object") throw new Error("Invalid task input");
-      identity(input.taskId);
+      if ("taskId" in (input as CreateTaskInput & { taskId?: unknown })) throw new Error("Invalid task input");
       identity(input.seedHash);
-      const parsed = parseFileInfo(input.seedHash, input);
+      const parsed = parseResume(input.seedHash, input.resume);
       const state: State = {
-        version: 1, taskId: input.taskId, seedHash: input.seedHash, revision: 0, sequence: 0, now: 0,
+        version: 1, seedHash: input.seedHash, revision: 0, sequence: 0, now: 0,
         config: clone(defaults), intent: "ready", failure: null, price: { mode: "auto", manualValue: null }, seats: [],
         manifest: null, content: {}, completed: {}, sellers: {}, pools: {}, requests: {},
         spent: "0", seenEvents: {},
@@ -78,7 +76,7 @@ export function createDownloadScheduler(config: Config): DownloadScheduler {
       registerSeed(state);
       if (parsed) {
         applyFileInfo(state, parsed.derived, parsed.reused);
-        // 提供完整文件信息即声明本地 Seed 已验证：内核跳过购买。
+        // 提供 resume 即声明本地 Seed 已验证：内核跳过购买。
         state.completed[state.seedHash] = "reused";
       }
       return state;
@@ -90,13 +88,16 @@ export function createDownloadScheduler(config: Config): DownloadScheduler {
 export function restoreTask(snapshot: State): State {
   const s = clone(snapshot);
   // 单一格式：旧格式/附带废弃字段一律拒绝，不做静默剥离或迁移。
+  // 下载对象身份只看 seedHash；旧 taskId 字段一律拒绝。
   if (
     "wallet" in (s as State & { wallet?: unknown })
-    || Object.values(s.pools ?? {}).some(pool => "walletRevisionAtIntent" in (pool as Pool & { walletRevisionAtIntent?: unknown }))
+    || "taskId" in (s as State & { taskId?: unknown })
+    || Object.values(s.pools ?? {}).some(pool => "walletRevisionAtIntent" in (pool as Pool & { walletRevisionAtIntent?: unknown })
+      || "taskId" in (pool as Pool & { taskId?: unknown }))
     || (s.failure && "available" in s.failure)
     || "manifestKnown" in (s as State & { manifestKnown?: unknown })
   ) throw new Error("Unsupported task snapshot");
-  if (s.version !== 1 || !s.taskId || !s.seedHash) throw new Error("Unsupported task snapshot");
+  if (s.version !== 1 || !s.seedHash) throw new Error("Unsupported task snapshot");
   validateConfig(s.config); integer(s.now); integer(s.revision); integer(s.sequence);
   s.failure ??= null;
   if (s.quoteDiscovery) {
@@ -105,7 +106,7 @@ export function restoreTask(snapshot: State): State {
     }
     if (s.quoteDiscovery.pendingCommandId !== null) identity(s.quoteDiscovery.pendingCommandId);
   }
-  identity(s.taskId); identity(s.seedHash);
+  identity(s.seedHash);
   const derivedManifest = validateRestoredManifest(s);
   if (!["ready", "run", "pause", "cancel"].includes(s.intent)) throw new Error("Invalid snapshot intent");
   sats(s.spent);
@@ -124,7 +125,11 @@ export function restoreTask(snapshot: State): State {
   for (const [id, seller] of Object.entries(s.sellers)) {
     identity(id);
     if (id !== seller.id) throw new Error("Seller key mismatch");
-    if (seller.quote) { validateQuote(seller.quote); if (seller.quote.sellerId !== id) throw new Error("Quote seller mismatch"); }
+    if (seller.quote) {
+      // 旧报价字段在恢复时同样忽略并移除；旧快照经 manifest 判 Unsupported。
+      if ("blockBytes" in (seller.quote as object)) delete (seller.quote as unknown as Record<string, unknown>).blockBytes;
+      validateQuote(seller.quote); if (seller.quote.sellerId !== id) throw new Error("Quote seller mismatch");
+    }
     seller.blacklisted ??= false;
     if (typeof seller.blacklisted !== "boolean") throw new Error("Invalid blacklist flag");
     if (seller.failureCount !== undefined) integer(seller.failureCount, 0);
@@ -138,7 +143,10 @@ export function restoreTask(snapshot: State): State {
     if (seller.lastAt !== null) integer(seller.lastAt, 0);
   }
   for (const p of Object.values(s.pools)) {
-    if (p.quote) validateQuote(p.quote);
+    if (p.quote) {
+      if ("blockBytes" in (p.quote as object)) delete (p.quote as unknown as Record<string, unknown>).blockBytes;
+      validateQuote(p.quote);
+    }
     p.openingFee ??= p.quote?.fees.opening ?? "0";
     sats(p.openingFee); validateFees(p.fees);
     if (!s.sellers[p.sellerId] || (p.quote && p.quote.sellerId !== p.sellerId)) throw new Error("Missing pool seller");
@@ -158,6 +166,7 @@ export function restoreTask(snapshot: State): State {
       if (!original) throw new Error("Missing purchase quote evidence");
       r.quote = clone(original);
     }
+    if ("blockBytes" in (r.quote as object)) delete (r.quote as unknown as Record<string, unknown>).blockBytes;
     validateQuote(r.quote);
     if (["planned", "pending", "unresolved"].includes(r.state)) {
       if (s.pools[r.poolId].requestId !== r.id) throw new Error("Request ownership mismatch");
@@ -168,9 +177,9 @@ export function restoreTask(snapshot: State): State {
   return s;
 }
 
-function nextId(s: State, kind: string) { return `${s.taskId}/${kind}/${++s.sequence}`; }
+function nextId(s: State, kind: string) { return `${s.seedHash}/${kind}/${++s.sequence}`; }
 function base(s: State, reason: string) {
-  return { commandId: nextId(s, "command"), taskId: s.taskId, revision: s.revision, reason };
+  return { commandId: nextId(s, "command"), seedHash: s.seedHash, revision: s.revision, reason };
 }
 /** 任务调度内的存活池：已关闭、已失败和问题池都不再参与。 */
 function live(p: Pool) { return !["closed", "failed", "problem"].includes(p.funding); }
@@ -183,7 +192,7 @@ function drain(s: State, p: Pool, commands: Command[], reason: string) {
 /** 确定性伪随机：同一状态与候选集合在重放中必然选中同一卖家。 */function pickRandom(s: State, ids: string[]): string {
   const sorted = [...ids].sort();
   let h = 2166136261;
-  const seed = `${s.taskId}|${s.sequence}|${sorted.join(",")}`;
+  const seed = `${s.seedHash}|${s.sequence}|${sorted.join(",")}`;
   for (let i = 0; i < seed.length; i++) { h ^= seed.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; }
   return sorted[h % sorted.length];
 }
@@ -237,8 +246,9 @@ function reviewSeats(s: State, drained: Set<string>, desired: Set<string>, quali
   }
 }
 
-function contentCost(q: Quote, items: Content[]): bigint {
-  return items.reduce((n, item) => n + price(q, item), 0n);
+function contentCost(s: State, q: Quote, items: Content[]): bigint {
+  const tail = tailBlockId(s.manifest);
+  return items.reduce((n, item) => n + price(q, item, item.kind === "block" && item.id === tail), 0n);
 }
 
 /** 一份工作从准备资金起排他占用内容；池可用后发出同一份工作。 */
@@ -311,7 +321,7 @@ function plan(s: State, reviewedSeller?: string): Command[] {
     if (p.funding !== "open" || r?.state !== "planned") continue;
     const items = r.contentIds.map(id => s.content[id]);
     if (sats(r.quote.blockPrice) > rec.effective || r.quote.expiresAt <= s.now
-      || contentCost(r.quote, items) + reserve(p.fees, items.length) > sats(p.amount) - sats(p.committed)) {
+      || contentCost(s, r.quote, items) + reserve(p.fees, items.length) > sats(p.amount) - sats(p.committed)) {
       r.state = "rejected"; p.requestId = null;
       drain(s, p, commands, "work-invalidated");
     } else dispatch(s, p, r, commands);
@@ -338,7 +348,7 @@ function plan(s: State, reviewedSeller?: string): Command[] {
     if (!items.length) continue;
     if (p) {
       const affordable = [...items];
-      while (affordable.length && contentCost(q, affordable) + reserve(p.fees, affordable.length) > sats(p.amount) - sats(p.committed)) affordable.pop();
+      while (affordable.length && contentCost(s, q, affordable) + reserve(p.fees, affordable.length) > sats(p.amount) - sats(p.committed)) affordable.pop();
       if (affordable.length) items = affordable;
       else { drain(s, p, commands, "pool-exhausted"); p = undefined; }
     }
@@ -346,21 +356,22 @@ function plan(s: State, reviewedSeller?: string): Command[] {
     // for insufficient funds; never shrink work to consume the remaining balance.
     const requestId = nextId(s, "request");
     const poolId = p?.id ?? nextId(s, "pool");
-    const prices = Object.fromEntries(items.map(item => [item.id, String(price(q, item))]));
+    const tail = tailBlockId(s.manifest);
+    const prices = Object.fromEntries(items.map(item => [item.id, String(price(q, item, item.kind === "block" && item.id === tail))]));
     const work: State["requests"][string] = { id: requestId, commandId: "", poolId,
       quote: clone(q), contentIds: items.map(item => item.id), prices,
       startedAt: s.now, lastProgressAt: s.now, transferredBytes: 0, state: "planned" };
     s.requests[requestId] = work;
     for (const item of items) claimed.add(item.id);
     if (p) { dispatch(s, p, work, commands); continue; }
-    const budget = contentCost(q, items), reserved = reserve(q.fees, items.length);
+    const budget = contentCost(s, q, items), reserved = reserve(q.fees, items.length);
     const count = items.filter(item => item.kind === "block").length;
     const command: Command = { ...base(s, "work-assigned"), type: "open", poolId,
       sellerId: id, sessionId: q.sessionId, quote: clone(q), amount: String(budget + reserved),
       contentBudget: String(budget), reserve: String(reserved), openingFee: q.fees.opening,
       blockCapacity: count, requestId, contentIds: [...work.contentIds] };
     work.commandId = command.commandId;
-    s.pools[poolId] = { id: poolId, taskId: s.taskId, sellerId: id, sessionId: q.sessionId,
+    s.pools[poolId] = { id: poolId, sellerId: id, sessionId: q.sessionId,
       quote: clone(q), openingFee: q.fees.opening, fees: clone(q.fees), amount: command.amount, committed: "0", blockCapacity: count, purchasedBlocks: 0,
       funding: "opening", scheduling: "idle", openCommandId: command.commandId,
       closeCommandId: null, requestId, drainReason: null, returned: null, refundAvailable: false,
@@ -414,7 +425,7 @@ export function step(previous: State, event: Event): Result {
 }
 function stepKernel(previous: State, event: Event): Result {
   identity(event.eventId);
-  if (event.taskId !== previous.taskId || !event.eventId) throw new Error("Wrong task event");
+  if (event.seedHash !== previous.seedHash || !event.eventId) throw new Error("Wrong task event");
   integer(event.receivedAt); integer(event.occurredAt);
   if (event.occurredAt > event.receivedAt) throw new Error("Event received before occurrence");
   if (previous.seenEvents[event.eventId]) return { state: previous, commands: [], view: view(previous), nextWakeAt: nextWakeAt(previous) };

@@ -37,8 +37,8 @@ func availableContent(s *State, quote Quote) []Content {
 	return result
 }
 
-// sellerSpeed is the cumulative accepted block bytes divided by transfer time.
-// Not measured returns nil; measured but zero bytes returns 0.
+// sellerSpeed is the cumulative accepted verified block bytes divided by
+// transfer time. Not measured returns nil; measured but zero bytes returns 0.
 func sellerSpeed(s *State, sellerID string) *float64 {
 	seller := s.Sellers[sellerID]
 	if seller == nil || !seller.Measured {
@@ -231,6 +231,7 @@ func view(s *State) View {
 	costMin := big.NewInt(0)
 	costMax := big.NewInt(0)
 	covered := true
+	tail, hasTail := tailBlockID(s.Manifest)
 	for _, item := range pendingContent(s) {
 		var request *Request
 		for _, candidate := range sortedRequests(s) {
@@ -239,6 +240,7 @@ func view(s *State) View {
 				break
 			}
 		}
+		isTail := hasTail && item.Kind == "block" && item.ID == tail
 		prices := make([]*big.Int, 0)
 		if request != nil {
 			prices = append(prices, sats(request.Prices[item.ID]))
@@ -247,7 +249,7 @@ func view(s *State) View {
 				if quote.ContentIDs != nil && !containsString(quote.ContentIDs, item.ID) {
 					continue
 				}
-				prices = append(prices, price(quote, item))
+				prices = append(prices, price(quote, item, isTail))
 			}
 		}
 		if len(prices) == 0 {
@@ -391,7 +393,7 @@ func view(s *State) View {
 		estimate = &EstimatedContent{Min: costMin.String(), Max: costMax.String()}
 	}
 	return View{
-		TaskID:                    s.TaskID,
+		SeedHash:                  s.SeedHash,
 		Revision:                  s.Revision,
 		Execution:                 execution,
 		Failure:                   s.Failure,

@@ -15,14 +15,14 @@ import (
 var errUnsupportedSnapshot = errors.New("Unsupported task snapshot")
 
 // State decodes with legacy-marker rejection: the old format carried
-// `manifestKnown` and a top-level `wallet`; both are rejected outright, and
-// the new `manifest` field is required (it may be null).
+// `manifestKnown`, a top-level `wallet` and a download `taskId`; all are
+// rejected outright, and the new `manifest` field is required (it may be null).
 func (s *State) UnmarshalJSON(data []byte) error {
 	var keys map[string]json.RawMessage
 	if err := json.Unmarshal(data, &keys); err != nil {
 		return err
 	}
-	for _, legacy := range []string{"manifestKnown", "wallet"} {
+	for _, legacy := range []string{"manifestKnown", "wallet", "taskId"} {
 		if _, ok := keys[legacy]; ok {
 			return errUnsupportedSnapshot
 		}
@@ -39,13 +39,17 @@ func (s *State) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// Pool rejects the obsolete walletRevisionAtIntent hint.
+// Pool rejects the obsolete walletRevisionAtIntent hint and the old
+// download-level taskId; pool identity is fully covered by its own id.
 func (p *Pool) UnmarshalJSON(data []byte) error {
 	var keys map[string]json.RawMessage
 	if err := json.Unmarshal(data, &keys); err != nil {
 		return err
 	}
 	if _, ok := keys["walletRevisionAtIntent"]; ok {
+		return errUnsupportedSnapshot
+	}
+	if _, ok := keys["taskId"]; ok {
 		return errUnsupportedSnapshot
 	}
 	type plain Pool
@@ -75,23 +79,21 @@ func (f *TaskFailure) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// Manifest accepts exactly the three new fields; anything else is rejected.
-// All three fields are required: a missing fileBytes must not silently
-// become 0 (which would mean "known empty file").
+// Manifest accepts exactly the new field; anything else is rejected.
+// blockHashes is required (it may be empty for a known-empty file, but a
+// missing or null list means the snapshot shape is obsolete).
 func (m *Manifest) UnmarshalJSON(data []byte) error {
 	var keys map[string]json.RawMessage
 	if err := json.Unmarshal(data, &keys); err != nil {
 		return err
 	}
-	for _, required := range []string{"fileBytes", "blockBytes", "blockHashes"} {
-		raw, ok := keys[required]
-		if !ok || string(raw) == "null" {
-			return errUnsupportedSnapshot
-		}
+	raw, ok := keys["blockHashes"]
+	if !ok || string(raw) == "null" {
+		return errUnsupportedSnapshot
 	}
 	for key := range keys {
 		switch key {
-		case "fileBytes", "blockBytes", "blockHashes":
+		case "blockHashes":
 		default:
 			return errUnsupportedSnapshot
 		}
@@ -105,23 +107,40 @@ func (m *Manifest) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// Content rejects the obsolete bytes hint; content identity is hash-only.
+func (c *Content) UnmarshalJSON(data []byte) error {
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(data, &keys); err != nil {
+		return err
+	}
+	if _, ok := keys["bytes"]; ok {
+		return errUnsupportedSnapshot
+	}
+	type plain Content
+	var aux plain
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	*c = Content(aux)
+	return nil
+}
+
+// Quote carries no custom decoding: the obsolete blockBytes hint is ignored
+// at entry (matching the TypeScript strip) and never persisted; old snapshots
+// are still rejected via the manifest shape.
+
 // Sats is a canonical decimal integer string.
 type Sats = string
 
-// Content is one deductible unit (seed or block). Seeds carry no Bytes
-// (the seed size is unknown; no upper-bound check) — blocks carry their
-// derived byte length.
+// Content is one deductible unit (seed or block). Identity is hash-only;
+// accepted byte counts are execution stats for speed, never identity.
 type Content struct {
-	ID    string `json:"id"`
-	Kind  string `json:"kind"`
-	Bytes *int64 `json:"bytes,omitempty"`
+	ID   string `json:"id"`
+	Kind string `json:"kind"`
 }
 
-// Manifest is the complete ordered block list (duplicates allowed) and the
-// fixed block size plus tail derivation inputs.
+// Manifest is the complete ordered block list (duplicates allowed).
 type Manifest struct {
-	FileBytes   int64    `json:"fileBytes"`
-	BlockBytes  int64    `json:"blockBytes"`
 	BlockHashes []string `json:"blockHashes"`
 }
 
@@ -134,7 +153,8 @@ type Fees struct {
 	ArbitrationPerItem Sats  `json:"arbitrationPerItem"`
 }
 
-// Quote is a verified seller quote.
+// Quote is a verified seller quote. TailPrice quotes the manifest tail hash;
+// when absent it falls back to BlockPrice.
 type Quote struct {
 	ID         string   `json:"id"`
 	Version    int64    `json:"version"`
@@ -143,7 +163,6 @@ type Quote struct {
 	ExpiresAt  int64    `json:"expiresAt"`
 	BlockPrice Sats     `json:"blockPrice"`
 	SeedPrice  Sats     `json:"seedPrice"`
-	BlockBytes int64    `json:"blockBytes"`
 	TailPrice  *Sats    `json:"tailPrice,omitempty"`
 	MaxBlocks  int64    `json:"maxBlocks"`
 	Fees       Fees     `json:"fees"`
@@ -187,7 +206,6 @@ type PoolScheduling = string
 // Pool is one seller's fee pool.
 type Pool struct {
 	ID              string         `json:"id"`
-	TaskID          string         `json:"taskId"`
 	SellerID        string         `json:"sellerId"`
 	SessionID       string         `json:"sessionId"`
 	Quote           *Quote         `json:"quote,omitempty"`
@@ -240,66 +258,67 @@ type QuoteDiscovery struct {
 
 // State is the complete kernel state (JSON-serializable, version 1).
 type State struct {
-	Version        int                 `json:"version"`
-	TaskID         string              `json:"taskId"`
-	SeedHash       string              `json:"seedHash"`
-	Revision       int64               `json:"revision"`
-	Sequence       int64               `json:"sequence"`
-	Now            int64               `json:"now"`
-	Config         Config              `json:"config"`
-	Intent         string              `json:"intent"`
-	Failure        *TaskFailure        `json:"failure"`
-	QuoteDiscovery *QuoteDiscovery     `json:"quoteDiscovery,omitempty"`
-	Price          Slider              `json:"price"`
-	Seats          []string            `json:"seats"`
+	Version        int             `json:"version"`
+	SeedHash       string          `json:"seedHash"`
+	Revision       int64           `json:"revision"`
+	Sequence       int64           `json:"sequence"`
+	Now            int64           `json:"now"`
+	Config         Config          `json:"config"`
+	Intent         string          `json:"intent"`
+	Failure        *TaskFailure    `json:"failure"`
+	QuoteDiscovery *QuoteDiscovery `json:"quoteDiscovery,omitempty"`
+	Price          Slider          `json:"price"`
+	Seats          []string        `json:"seats"`
 	// Manifest is the file structure; nil means the seed is not known yet.
-	Manifest       *Manifest           `json:"manifest"`
-	Content        contentStore        `json:"content"`
-	Completed      map[string]string   `json:"completed"`
-	Sellers        map[string]*Seller  `json:"sellers"`
-	Pools          map[string]*Pool    `json:"pools"`
-	Requests       map[string]*Request `json:"requests"`
-	Spent          Sats                `json:"spent"`
-	SeenEvents     map[string]bool     `json:"seenEvents"`
+	Manifest   *Manifest           `json:"manifest"`
+	Content    contentStore        `json:"content"`
+	Completed  map[string]string   `json:"completed"`
+	Sellers    map[string]*Seller  `json:"sellers"`
+	Pools      map[string]*Pool    `json:"pools"`
+	Requests   map[string]*Request `json:"requests"`
+	Spent      Sats                `json:"spent"`
+	SeenEvents map[string]bool     `json:"seenEvents"`
 }
 
 // Event is one host fact applied to the kernel.
 type Event struct {
 	Type string `json:"type"`
 
-	MaxBlockPrice     *Sats     `json:"maxBlockPrice,omitempty"`
-	BaseSeats         *int64    `json:"baseSeats,omitempty"`
-	FloatingSeats     *int64    `json:"floatingSeats,omitempty"`
-	Slider            string    `json:"slider,omitempty"`
-	Value             string    `json:"value,omitempty"`
-	FileBytes         *int64    `json:"fileBytes,omitempty"`
-	BlockBytes        *int64    `json:"blockBytes,omitempty"`
-	BlockHashes       []string  `json:"blockHashes"`
-	ReusedBlockHashes []string  `json:"reusedBlockHashes,omitempty"`
-	Quote             *Quote    `json:"quote,omitempty"`
-	SellerID          string    `json:"sellerId,omitempty"`
-	Online            *bool     `json:"online,omitempty"`
-	Enabled           *bool     `json:"enabled,omitempty"`
-	InsufficientFunds bool      `json:"insufficientFunds,omitempty"`
-	PoolID            string    `json:"poolId,omitempty"`
-	SessionID         string    `json:"sessionId,omitempty"`
-	Amount            Sats      `json:"amount,omitempty"`
-	Committed         Sats      `json:"committed,omitempty"`
-	Fees              *Fees     `json:"fees,omitempty"`
-	CommandID         string    `json:"commandId,omitempty"`
-	Released          *bool     `json:"released,omitempty"`
-	RequestID         string    `json:"requestId,omitempty"`
-	Bytes             *int64    `json:"bytes,omitempty"`
-	Accepted          []string  `json:"accepted,omitempty"`
-	Paid              string    `json:"paid,omitempty"`
-	StartedAt         int64     `json:"startedAt,omitempty"`
-	EndedAt           int64     `json:"endedAt,omitempty"`
-	SafeToRetry       *bool     `json:"safeToRetry,omitempty"`
-	Returned          string    `json:"returned,omitempty"`
-	Spent             string    `json:"spent,omitempty"`
+	MaxBlockPrice     *Sats    `json:"maxBlockPrice,omitempty"`
+	BaseSeats         *int64   `json:"baseSeats,omitempty"`
+	FloatingSeats     *int64   `json:"floatingSeats,omitempty"`
+	Slider            string   `json:"slider,omitempty"`
+	Value             string   `json:"value,omitempty"`
+	BlockHashes       []string `json:"blockHashes"`
+	ReusedBlockHashes []string `json:"reusedBlockHashes,omitempty"`
+	// reusedWasNull records an explicit JSON null for the optional reuse list,
+	// which rejects like the TypeScript entry (only omission means unprovided).
+	reusedWasNull      bool     `json:"-"`
+	Quote              *Quote   `json:"quote,omitempty"`
+	SellerID           string   `json:"sellerId,omitempty"`
+	Online             *bool    `json:"online,omitempty"`
+	Enabled            *bool    `json:"enabled,omitempty"`
+	InsufficientFunds  bool     `json:"insufficientFunds,omitempty"`
+	PoolID             string   `json:"poolId,omitempty"`
+	SessionID          string   `json:"sessionId,omitempty"`
+	Amount             Sats     `json:"amount,omitempty"`
+	Committed          Sats     `json:"committed,omitempty"`
+	Fees               *Fees    `json:"fees,omitempty"`
+	CommandID          string   `json:"commandId,omitempty"`
+	Released           *bool    `json:"released,omitempty"`
+	RequestID          string   `json:"requestId,omitempty"`
+	Bytes              *int64   `json:"bytes,omitempty"`
+	Accepted           []string `json:"accepted,omitempty"`
+	Paid               string   `json:"paid,omitempty"`
+	AcceptedBlockBytes *int64   `json:"acceptedBlockBytes,omitempty"`
+	StartedAt          int64    `json:"startedAt,omitempty"`
+	EndedAt            int64    `json:"endedAt,omitempty"`
+	SafeToRetry        *bool    `json:"safeToRetry,omitempty"`
+	Returned           string   `json:"returned,omitempty"`
+	Spent              string   `json:"spent,omitempty"`
 
 	EventID    string `json:"eventId"`
-	TaskID     string `json:"taskId"`
+	SeedHash   string `json:"seedHash"`
 	OccurredAt int64  `json:"occurredAt"`
 	ReceivedAt int64  `json:"receivedAt"`
 }
@@ -307,7 +326,7 @@ type Event struct {
 // Command is one host execution intent.
 type Command struct {
 	CommandID string `json:"commandId"`
-	TaskID    string `json:"taskId"`
+	SeedHash  string `json:"seedHash"`
 	Revision  int64  `json:"revision"`
 	Reason    string `json:"reason"`
 	Type      string `json:"type"`
@@ -355,7 +374,7 @@ type SellerSpeedView struct {
 
 // View is the host/UI projection.
 type View struct {
-	TaskID                    string                     `json:"taskId"`
+	SeedHash                  string                     `json:"seedHash"`
 	Revision                  int64                      `json:"revision"`
 	Failure                   *TaskFailure               `json:"failure"`
 	Execution                 string                     `json:"execution"`
@@ -408,38 +427,112 @@ type Result struct {
 	NextWakeAt *int64    `json:"nextWakeAt"`
 }
 
-// MarshalJSON preserves the omitted-vs-empty distinction: nil slices are
-// dropped so seed-only inputs never encode `"blockHashes": null` (which
-// strict readers reject as an explicit null), while an explicitly empty
-// ordered list survives the round-trip.
+// MarshalJSON preserves the omitted-vs-empty distinction: a nil Resume is
+// dropped so seed-only inputs never encode `"resume": null`, while an
+// explicitly empty ordered list survives the round-trip. An explicitly null
+// reuse list round-trips as null so the rejection is preserved.
 func (c CreateTaskInput) MarshalJSON() ([]byte, error) {
 	out := map[string]any{
-		"taskId":   c.TaskID,
 		"seedHash": c.SeedHash,
 	}
-	if c.FileBytes != nil {
-		out["fileBytes"] = *c.FileBytes
+	// Preserve a legacy taskId marker through a JSON round-trip so the
+	// rejection stays observable; it is never persisted or acted upon.
+	if c.hadTaskID {
+		out["taskId"] = true
 	}
-	if c.BlockBytes != nil {
-		out["blockBytes"] = *c.BlockBytes
-	}
-	if c.BlockHashes != nil {
-		out["blockHashes"] = append([]string{}, c.BlockHashes...)
-	}
-	if c.ReusedBlockHashes != nil {
-		out["reusedBlockHashes"] = append([]string{}, c.ReusedBlockHashes...)
+	if c.Resume != nil {
+		resume := map[string]any{}
+		if c.Resume.BlockHashes != nil {
+			resume["blockHashes"] = append([]string{}, c.Resume.BlockHashes...)
+		}
+		if c.Resume.ReusedBlockHashes != nil {
+			resume["reusedBlockHashes"] = append([]string{}, c.Resume.ReusedBlockHashes...)
+		} else if c.Resume.reusedWasNull {
+			resume["reusedBlockHashes"] = nil
+		}
+		out["resume"] = resume
 	}
 	return json.Marshal(out)
 }
 
-// CreateTaskInput holds the explicit facts for a fresh task: only the seed
-// hash (manifest unknown) or a complete, verified file structure. Providing
-// the full file information asserts the local Seed is available and verified.
-type CreateTaskInput struct {
-	TaskID            string   `json:"taskId"`
-	SeedHash          string   `json:"seedHash"`
-	FileBytes         *int64   `json:"fileBytes,omitempty"`
-	BlockBytes        *int64   `json:"blockBytes,omitempty"`
+// UnmarshalJSON distinguishes omitted resume (unknown manifest) from explicit
+// null (rejected like the TypeScript entry), and records a legacy taskId so
+// CreateTask can reject it exactly like the TypeScript entry.
+func (c *CreateTaskInput) UnmarshalJSON(data []byte) error {
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(data, &keys); err != nil {
+		return err
+	}
+	type plain CreateTaskInput
+	var aux plain
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if raw, ok := keys["resume"]; ok && string(raw) == "null" {
+		aux.Resume = &CreateResume{}
+	}
+	if _, ok := keys["taskId"]; ok {
+		aux.hadTaskID = true
+	}
+	*c = CreateTaskInput(aux)
+	return nil
+}
+
+// CreateResume is a verified local seed plus its complete ordered block list.
+type CreateResume struct {
 	BlockHashes       []string `json:"blockHashes"`
 	ReusedBlockHashes []string `json:"reusedBlockHashes,omitempty"`
+	// reusedWasNull records an explicit JSON null for the optional reuse list.
+	reusedWasNull bool `json:"-"`
+}
+
+// UnmarshalJSON records an explicit null reuse list so it rejects.
+func (r *CreateResume) UnmarshalJSON(data []byte) error {
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(data, &keys); err != nil {
+		return err
+	}
+	wasNull := false
+	if raw, ok := keys["reusedBlockHashes"]; ok && string(raw) == "null" {
+		wasNull = true
+	}
+	type plain CreateResume
+	var aux plain
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	*r = CreateResume(aux)
+	r.reusedWasNull = wasNull
+	return nil
+}
+
+// UnmarshalJSON records an explicit null reuse list so manifest events reject.
+func (e *Event) UnmarshalJSON(data []byte) error {
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(data, &keys); err != nil {
+		return err
+	}
+	wasNull := false
+	if raw, ok := keys["reusedBlockHashes"]; ok && string(raw) == "null" {
+		wasNull = true
+	}
+	type plain Event
+	var aux plain
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	*e = Event(aux)
+	e.reusedWasNull = wasNull
+	return nil
+}
+
+// CreateTaskInput holds the explicit facts for a fresh task: only the seed
+// hash (manifest unknown) or a verified resume. Providing resume asserts the
+// local Seed is available and verified. A legacy taskId is never accepted;
+// hadTaskID only carries the rejection through a JSON round-trip.
+type CreateTaskInput struct {
+	SeedHash string        `json:"seedHash"`
+	Resume   *CreateResume `json:"resume,omitempty"`
+
+	hadTaskID bool `json:"-"`
 }

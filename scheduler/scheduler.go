@@ -36,17 +36,19 @@ func (s *Scheduler) Config() Config { return s.config }
 // CreateTask builds a fresh task state from explicit facts only.
 func (s *Scheduler) CreateTask(input CreateTaskInput) (state State, err error) {
 	defer recoverTo(&err)
-	identity(input.TaskID)
+	if input.hadTaskID {
+		fail("Invalid task input")
+	}
 	identity(input.SeedHash)
-	derived, reused, ok := parseFileInfo(input.SeedHash, input.FileBytes, input.BlockBytes, input.BlockHashes, input.ReusedBlockHashes)
-	state = State{Version: 1, TaskID: input.TaskID, SeedHash: input.SeedHash, Config: s.config, Intent: "ready",
+	derived, reused, ok := parseResume(input.SeedHash, input.Resume)
+	state = State{Version: 1, SeedHash: input.SeedHash, Config: s.config, Intent: "ready",
 		Price: Slider{Mode: "auto"}, Seats: []string{}, Content: newContentStore(),
 		Completed: map[string]string{}, Sellers: map[string]*Seller{}, Pools: map[string]*Pool{}, Requests: map[string]*Request{},
 		Spent: "0", SeenEvents: map[string]bool{}}
 	registerSeed(&state)
 	if ok {
 		applyFileInfo(&state, derived, reused)
-		// Providing full file information asserts the local Seed is verified.
+		// Providing resume asserts the local Seed is verified.
 		state.Completed[state.SeedHash] = "reused"
 	}
 	return state, nil
@@ -59,14 +61,13 @@ func RestoreTask(snapshot State) (state State, err error) {
 		return State{}, err
 	}
 	s := &state
-	if s.Version != 1 || s.TaskID == "" || s.SeedHash == "" {
+	if s.Version != 1 || s.SeedHash == "" {
 		fail("Unsupported task snapshot")
 	}
 	validateConfig(s.Config)
 	integer(s.Now, 0)
 	integer(s.Revision, 0)
 	integer(s.Sequence, 0)
-	identity(s.TaskID)
 	identity(s.SeedHash)
 	if s.Intent != "ready" && s.Intent != "run" && s.Intent != "pause" && s.Intent != "cancel" {
 		fail("Invalid snapshot intent")
@@ -103,7 +104,7 @@ func RestoreTask(snapshot State) (state State, err error) {
 	if s.Manifest != nil {
 		derived, derr := func() (d derivedFileInfo, err error) {
 			defer recoverTo(&err)
-			d = deriveFileInfo(s.SeedHash, s.Manifest.FileBytes, s.Manifest.BlockBytes, s.Manifest.BlockHashes)
+			d = deriveFileInfo(s.SeedHash, s.Manifest.BlockHashes)
 			return d, nil
 		}()
 		if derr != nil {
@@ -219,7 +220,7 @@ func Step(previous State, event Event) (result Result, err error) {
 	defer debugStep(previous, event, &result, &err)()
 	defer recoverTo(&err)
 	identity(event.EventID)
-	if event.TaskID != previous.TaskID || event.EventID == "" {
+	if event.SeedHash != previous.SeedHash || event.EventID == "" {
 		fail("Wrong task event")
 	}
 	integer(event.ReceivedAt, 0)
@@ -280,15 +281,16 @@ func nextWakeAt(s *State) *int64 {
 	return at
 }
 
-func workCost(q Quote, items []Content) *big.Int {
+func workCost(s *State, q Quote, items []Content) *big.Int {
+	tail, hasTail := tailBlockID(s.Manifest)
 	total := big.NewInt(0)
 	for _, item := range items {
-		total.Add(total, price(q, item))
+		total.Add(total, price(q, item, hasTail && item.Kind == "block" && item.ID == tail))
 	}
 	return total
 }
-func workRequired(q Quote, fees Fees, items []Content) *big.Int {
-	return new(big.Int).Add(workCost(q, items), reserve(fees, int64(len(items))))
+func workRequired(s *State, q Quote, fees Fees, items []Content) *big.Int {
+	return new(big.Int).Add(workCost(s, q, items), reserve(fees, int64(len(items))))
 }
 func dispatchWork(s *State, p *Pool, r *Request, commands *[]Command) {
 	r.State = "pending"
@@ -455,7 +457,7 @@ func plan(s *State, reviewed string) []Command {
 				item, _ := s.Content.Get(cid)
 				items = append(items, item)
 			}
-			if sats(r.Quote.BlockPrice).Cmp(effectivePrice(s)) > 0 || r.Quote.ExpiresAt <= s.Now || workRequired(r.Quote, p.Fees, items).Cmp(new(big.Int).Sub(sats(p.Amount), sats(p.Committed))) > 0 {
+			if sats(r.Quote.BlockPrice).Cmp(effectivePrice(s)) > 0 || r.Quote.ExpiresAt <= s.Now || workRequired(s, r.Quote, p.Fees, items).Cmp(new(big.Int).Sub(sats(p.Amount), sats(p.Committed))) > 0 {
 				r.State = "rejected"
 				p.RequestID = nil
 				drain(s, p, &commands, "work-invalidated")
@@ -538,7 +540,7 @@ func plan(s *State, reviewed string) []Command {
 			}
 			if p != nil {
 				affordable := append([]Content{}, items...)
-				for len(affordable) > 0 && workRequired(*q, p.Fees, affordable).Cmp(new(big.Int).Sub(sats(p.Amount), sats(p.Committed))) > 0 {
+				for len(affordable) > 0 && workRequired(s, *q, p.Fees, affordable).Cmp(new(big.Int).Sub(sats(p.Amount), sats(p.Committed))) > 0 {
 					affordable = affordable[:len(affordable)-1]
 				}
 				if len(affordable) > 0 {
@@ -555,11 +557,12 @@ func plan(s *State, reviewed string) []Command {
 			} else {
 				poolID = nextID(s, "pool")
 			}
+			tail, hasTail := tailBlockID(s.Manifest)
 			prices := map[string]Sats{}
 			contentIDs := []string{}
 			count := int64(0)
 			for _, item := range items {
-				prices[item.ID] = price(*q, item).String()
+				prices[item.ID] = price(*q, item, hasTail && item.Kind == "block" && item.ID == tail).String()
 				contentIDs = append(contentIDs, item.ID)
 				claimed[item.ID] = true
 				if item.Kind == "block" {
@@ -572,7 +575,7 @@ func plan(s *State, reviewed string) []Command {
 				dispatchWork(s, p, r, &commands)
 				continue
 			}
-			budget := workCost(*q, items)
+			budget := workCost(s, *q, items)
 			reserved := reserve(q.Fees, int64(len(items)))
 			c := base(s, "work-assigned")
 			c.Type = "open"
@@ -589,7 +592,7 @@ func plan(s *State, reviewed string) []Command {
 			c.RequestID = requestID
 			c.ContentIDs = append([]string{}, contentIDs...)
 			r.CommandID = c.CommandID
-			s.Pools[poolID] = &Pool{ID: poolID, TaskID: s.TaskID, SellerID: id, SessionID: q.SessionID, Quote: &qc, OpeningFee: q.Fees.Opening, Fees: q.Fees, Amount: c.Amount, Committed: "0", BlockCapacity: count,
+			s.Pools[poolID] = &Pool{ID: poolID, SellerID: id, SessionID: q.SessionID, Quote: &qc, OpeningFee: q.Fees.Opening, Fees: q.Fees, Amount: c.Amount, Committed: "0", BlockCapacity: count,
 				Funding: "opening", Scheduling: "idle", OpenCommandID: c.CommandID, RequestID: &r.ID}
 			commands = append(commands, c)
 		}
@@ -646,10 +649,10 @@ func isLive(p *Pool) bool {
 }
 func nextID(s *State, kind string) string {
 	s.Sequence++
-	return fmt.Sprintf("%s/%s/%d", s.TaskID, kind, s.Sequence)
+	return fmt.Sprintf("%s/%s/%d", s.SeedHash, kind, s.Sequence)
 }
 func base(s *State, reason string) Command {
-	return Command{CommandID: nextID(s, "command"), TaskID: s.TaskID, Revision: s.Revision, Reason: reason}
+	return Command{CommandID: nextID(s, "command"), SeedHash: s.SeedHash, Revision: s.Revision, Reason: reason}
 }
 func drain(s *State, p *Pool, commands *[]Command, reason string) {
 	if p.Scheduling == "draining" || p.Scheduling == "retired" {
@@ -760,7 +763,7 @@ func pickRandom(s *State, ids []string) string {
 	sort.Slice(sorted, func(i, j int) bool {
 		return slices.Compare(utf16.Encode([]rune(sorted[i])), utf16.Encode([]rune(sorted[j]))) < 0
 	})
-	seed := fmt.Sprintf("%s|%d|%s", s.TaskID, s.Sequence, strings.Join(sorted, ","))
+	seed := fmt.Sprintf("%s|%d|%s", s.SeedHash, s.Sequence, strings.Join(sorted, ","))
 	hash := uint32(2166136261)
 	for _, unit := range utf16.Encode([]rune(seed)) {
 		hash ^= uint32(unit)

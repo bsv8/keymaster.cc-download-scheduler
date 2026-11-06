@@ -22,14 +22,14 @@ func recordFailedAttempt(seller *Seller, bytes, startedAt, at int64) {
 	seller.LastAt = &at
 }
 
-// registerSeed records the seed content (no byte length); exactly one per task.
+// registerSeed records the seed content; exactly one per task.
 func registerSeed(s *State) {
 	s.Content.Set(Content{ID: s.SeedHash, Kind: "seed"})
 }
 
 // markReused appends reused blocks; it never overwrites a purchase record and
 // never releases an outstanding claim. Already-purchased blocks keep purchased.
-func markReused(s *State, reused []string, blocks map[string]int64) {
+func markReused(s *State, reused []string, blocks map[string]bool) {
 	seen := map[string]bool{}
 	unique := []string{}
 	for _, id := range reused {
@@ -40,7 +40,7 @@ func markReused(s *State, reused []string, blocks map[string]int64) {
 		unique = append(unique, id)
 	}
 	for _, id := range unique {
-		if _, ok := blocks[id]; !ok {
+		if !blocks[id] {
 			fail("Unknown reused content")
 		}
 	}
@@ -65,14 +65,13 @@ func markReused(s *State, reused []string, blocks map[string]int64) {
 // records the manifest.
 func applyFileInfo(s *State, derived derivedFileInfo, reused []string) {
 	for _, id := range derived.order {
-		size := derived.blocks[id]
 		if old, ok := s.Content.Get(id); ok {
-			if old.Kind != "block" || old.Bytes == nil || *old.Bytes != size {
+			if old.Kind != "block" {
 				fail("Conflicting content identity")
 			}
 			continue
 		}
-		s.Content.Set(Content{ID: id, Kind: "block", Bytes: &size})
+		s.Content.Set(Content{ID: id, Kind: "block"})
 	}
 	markReused(s, reused, derived.blocks)
 	manifest := cloneManifest(&derived.manifest)
@@ -157,13 +156,13 @@ func reduce(s *State, event Event) {
 		}
 		s.Price.Mode = "auto"
 	case "manifest":
-		if event.FileBytes == nil || event.BlockBytes == nil || event.BlockHashes == nil {
+		if event.BlockHashes == nil {
 			fail("Invalid manifest")
 		}
-		derived, reused, ok := parseFileInfo(s.SeedHash, event.FileBytes, event.BlockBytes, event.BlockHashes, event.ReusedBlockHashes)
-		if !ok {
+		if event.reusedWasNull {
 			fail("Invalid manifest")
 		}
+		derived, reused := parseManifestPayload(s.SeedHash, event.BlockHashes, event.ReusedBlockHashes)
 		if s.Manifest != nil {
 			// The manifest (including order and duplicates) is immutable once
 			// known; identical re-deliveries may only append valid reused blocks.
@@ -219,7 +218,7 @@ func reduce(s *State, event Event) {
 			break
 		}
 		ensureSeller(s, event.SellerID, true)
-		s.Pools[event.PoolID] = &Pool{ID: event.PoolID, TaskID: s.TaskID, SellerID: event.SellerID, SessionID: event.SessionID,
+		s.Pools[event.PoolID] = &Pool{ID: event.PoolID, SellerID: event.SellerID, SessionID: event.SessionID,
 			OpeningFee: "0", Fees: *event.Fees, Amount: event.Amount, Committed: event.Committed, Funding: "open", Scheduling: "idle",
 			OpeningObserved: true}
 	case "opened":
@@ -307,21 +306,6 @@ func reduce(s *State, event Event) {
 			fail("Invalid integer quantity")
 		}
 		integer(*event.Bytes, 0)
-		allKnown := true
-		var size int64
-		for _, id := range request.ContentIDs {
-			item, _ := s.Content.Get(id)
-			if item.Bytes == nil {
-				allKnown = false
-				continue
-			}
-			size += *item.Bytes
-		}
-		// Seed bytes are unknown: only the upper-bound check is skipped;
-		// progress advance and stall detection still apply.
-		if allKnown && *event.Bytes > size {
-			fail("Impossible transfer progress")
-		}
 		if *event.Bytes > request.TransferredBytes {
 			request.TransferredBytes = *event.Bytes
 			request.LastProgressAt = s.Now
@@ -354,6 +338,24 @@ func reduce(s *State, event Event) {
 			}
 			seen[id] = true
 		}
+		if event.AcceptedBlockBytes == nil {
+			fail("Invalid integer quantity")
+		}
+		integer(*event.AcceptedBlockBytes, 0)
+		acceptedBlocks := 0
+		for _, id := range event.Accepted {
+			item, _ := s.Content.Get(id)
+			if item.Kind == "block" {
+				acceptedBlocks++
+			}
+		}
+		// acceptedBlockBytes counts only verified block bytes in this accepted
+		// set, excluding the seed and duplicate positions. Protocol payloads
+		// are non-empty, so verified blocks imply a positive total; no blocks
+		// implies zero.
+		if (acceptedBlocks == 0 && *event.AcceptedBlockBytes != 0) || (acceptedBlocks > 0 && *event.AcceptedBlockBytes <= 0) {
+			fail("Invalid accepted bytes")
+		}
 		expected := big.NewInt(0)
 		for _, id := range event.Accepted {
 			expected.Add(expected, sats(request.Prices[id]))
@@ -367,12 +369,7 @@ func reduce(s *State, event Event) {
 			fail("Pool overspend")
 		}
 		pool.Committed = committed.String()
-		for _, id := range event.Accepted {
-			item, _ := s.Content.Get(id)
-			if item.Kind == "block" {
-				pool.PurchasedBlocks++
-			}
-		}
+		pool.PurchasedBlocks += int64(acceptedBlocks)
 		s.Spent = addSats(s.Spent, expected.String())
 		request.State = "settled"
 		pool.RequestID = nil
@@ -380,19 +377,12 @@ func reduce(s *State, event Event) {
 			s.Completed[id] = "purchased"
 		}
 		seller := s.Sellers[pool.SellerID]
-		var acceptedBytes int64
-		for _, id := range event.Accepted {
-			item, _ := s.Content.Get(id)
-			if item.Kind == "block" {
-				acceptedBytes += contentBytesOf(item)
-			}
-		}
 		if len(event.Accepted) == 0 {
 			seller.Blacklisted = true
 			seller.FailureCount++
 			recordFailedAttempt(seller, 0, event.StartedAt, event.EndedAt)
-		} else if acceptedBytes > 0 {
-			seller.BytesTotal += acceptedBytes
+		} else if acceptedBlocks > 0 {
+			seller.BytesTotal += *event.AcceptedBlockBytes
 			seller.TimeMsTotal += event.EndedAt - event.StartedAt
 			seller.Measured = true
 			seller.LastAt = &event.EndedAt
@@ -450,10 +440,11 @@ func reduce(s *State, event Event) {
 }
 
 func assertRequestPrices(s *State) {
+	tail, hasTail := tailBlockID(s.Manifest)
 	for _, request := range s.Requests {
 		for _, id := range request.ContentIDs {
 			item, _ := s.Content.Get(id)
-			expected := price(request.Quote, item)
+			expected := price(request.Quote, item, hasTail && item.Kind == "block" && id == tail)
 			if sats(request.Prices[id]).Cmp(expected) != 0 {
 				fail("Corrupt request prices")
 			}

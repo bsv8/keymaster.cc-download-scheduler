@@ -1,6 +1,6 @@
 {
   "name": "keymaster-trade-scheduler",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "description": "Deterministic, task-oriented download and funding-pool decisions",
   "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js", "default": "./dist/index.js" } },

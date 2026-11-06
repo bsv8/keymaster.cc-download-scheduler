@@ -3,101 +3,45 @@ package scheduler
 // derivedFileInfo is the validated, normalized file structure.
 type derivedFileInfo struct {
 	manifest Manifest
-	// blocks maps the deduplicated block IDs to their derived byte length.
-	blocks map[string]int64
+	// blocks is the deduplicated block set.
+	blocks map[string]bool
 	// order lists the deduplicated block IDs in first-seen order, matching
-	// the TypeScript Map insertion order.
+	// the TypeScript Set insertion order.
 	order []string
 }
 
-// contentBytesOf returns the required block bytes; seeds carry none.
-func contentBytesOf(item Content) int64 {
-	if item.Bytes == nil {
-		fail("Content bytes missing")
-	}
-	return *item.Bytes
-}
-
-// blockCount mirrors the TS blockCount helper: ceil(fileBytes / blockBytes),
-// with 0 bytes mapping to 0 blocks.
-func blockCountFor(fileBytes, blockBytes int64) int64 {
-	integer(fileBytes, 0)
-	integer(blockBytes, 1)
-	if fileBytes == 0 {
-		return 0
-	}
-	return (fileBytes-1)/blockBytes + 1
-}
-
-func blockBytesAt(fileBytes, blockBytes int64, index int64) int64 {
-	remaining := fileBytes - index * blockBytes
-	if remaining < blockBytes {
-		return remaining
-	}
-	return blockBytes
-}
-
-// deriveFileInfo validates and derives the file structure. Any inconsistency
-// aborts with a kernel error; callers guarantee the input state is discarded.
-func deriveFileInfo(seedHash string, fileBytes, blockBytes int64, blockHashes []string) derivedFileInfo {
+// deriveFileInfo validates the ordered block list. Any inconsistency aborts
+// with a kernel error; callers guarantee the input state is discarded.
+func deriveFileInfo(seedHash string, blockHashes []string) derivedFileInfo {
 	identity(seedHash)
-	integer(fileBytes, 0)
-	integer(blockBytes, 1)
-	expected := blockCountFor(fileBytes, blockBytes)
-	if int64(len(blockHashes)) != expected {
-		fail("Manifest block count mismatch")
+	if blockHashes == nil {
+		fail("Invalid manifest")
 	}
-	blocks := map[string]int64{}
+	blocks := map[string]bool{}
 	order := []string{}
-	for index, raw := range blockHashes {
+	for _, raw := range blockHashes {
 		hash := identity(raw)
 		if hash == seedHash {
 			fail("Invalid manifest")
 		}
-		size := blockBytesAt(fileBytes, blockBytes, int64(index))
-		if previous, ok := blocks[hash]; ok && previous != size {
-			fail("Conflicting content identity")
-		}
-		if _, ok := blocks[hash]; !ok {
+		if !blocks[hash] {
+			blocks[hash] = true
 			order = append(order, hash)
 		}
-		blocks[hash] = size
 	}
 	return derivedFileInfo{
-		manifest: Manifest{FileBytes: fileBytes, BlockBytes: blockBytes, BlockHashes: append([]string{}, blockHashes...)},
+		manifest: Manifest{BlockHashes: append([]string{}, blockHashes...)},
 		blocks:   blocks,
 		order:    order,
 	}
 }
 
-// parseFileInfo combines the create/manifest input validation: the three
-// fields are provided together or not at all; reused hashes must be unique
-// blocks of the manifest.
-func parseFileInfo(seedHash string, fileBytes, blockBytes *int64, blockHashes, reusedBlockHashes []string) (derivedFileInfo, []string, bool) {
-	provided := 0
-	for _, value := range []*int64{fileBytes, blockBytes} {
-		if value != nil {
-			provided++
-		}
-	}
-	if blockHashes != nil {
-		provided++
-	}
+func parseReused(blocks map[string]bool, reusedBlockHashes []string) []string {
 	if reusedBlockHashes != nil {
 		for _, id := range reusedBlockHashes {
 			identity(id)
 		}
 	}
-	if provided == 0 {
-		if reusedBlockHashes != nil {
-			fail("Invalid manifest")
-		}
-		return derivedFileInfo{}, nil, false
-	}
-	if provided != 3 {
-		fail("Invalid manifest")
-	}
-	derived := deriveFileInfo(seedHash, *fileBytes, *blockBytes, blockHashes)
 	seen := map[string]bool{}
 	reused := []string{}
 	for _, id := range reusedBlockHashes {
@@ -105,12 +49,48 @@ func parseFileInfo(seedHash string, fileBytes, blockBytes *int64, blockHashes, r
 			continue
 		}
 		seen[id] = true
-		if _, ok := derived.blocks[id]; !ok {
+		if !blocks[id] {
 			fail("Unknown reused content")
 		}
 		reused = append(reused, id)
 	}
-	return derived, reused, true
+	return reused
+}
+
+// parseResume validates the create input: a nil resume means the manifest is
+// unknown; otherwise blockHashes is required ([] means known-empty). Explicit
+// nulls reject; only omission means unprovided.
+func parseResume(seedHash string, resume *CreateResume) (derivedFileInfo, []string, bool) {
+	if resume == nil {
+		return derivedFileInfo{}, nil, false
+	}
+	if resume.reusedWasNull {
+		fail("Invalid manifest")
+	}
+	if resume.BlockHashes == nil {
+		fail("Invalid manifest")
+	}
+	derived := deriveFileInfo(seedHash, resume.BlockHashes)
+	return derived, parseReused(derived.blocks, resume.ReusedBlockHashes), true
+}
+
+// parseManifestPayload validates the flat manifest event: blockHashes is
+// required ([] means known-empty).
+func parseManifestPayload(seedHash string, blockHashes, reusedBlockHashes []string) (derivedFileInfo, []string) {
+	if blockHashes == nil {
+		fail("Invalid manifest")
+	}
+	derived := deriveFileInfo(seedHash, blockHashes)
+	return derived, parseReused(derived.blocks, reusedBlockHashes)
+}
+
+// tailBlockID returns the unique purchase object for the last manifest
+// position; empty or unknown manifests have no tail.
+func tailBlockID(manifest *Manifest) (string, bool) {
+	if manifest == nil || len(manifest.BlockHashes) == 0 {
+		return "", false
+	}
+	return manifest.BlockHashes[len(manifest.BlockHashes)-1], true
 }
 
 // sameManifest reports whether two manifests are identical including order and
@@ -119,7 +99,7 @@ func sameManifest(a, b *Manifest) bool {
 	if a == nil || b == nil {
 		return a == b
 	}
-	if a.FileBytes != b.FileBytes || a.BlockBytes != b.BlockBytes || len(a.BlockHashes) != len(b.BlockHashes) {
+	if len(a.BlockHashes) != len(b.BlockHashes) {
 		return false
 	}
 	for index := range a.BlockHashes {
@@ -139,13 +119,12 @@ func cloneManifest(manifest *Manifest) *Manifest {
 	return &cloned
 }
 
-// validateRestoredContent enforces the single new format: exactly one seed
-// whose ID is the task seed hash (seeds carry no bytes), and the unique block
-// set must match the derived manifest exactly (bytes included). With no
-// manifest, no block content may exist.
+// validateRestoredContent enforces the single format: exactly one seed whose
+// ID is the task seed hash, and the unique block set must match the derived
+// manifest exactly. With no manifest, no block content may exist.
 func validateRestoredContent(s *State, derived *derivedFileInfo) {
 	seeds := 0
-	blocks := map[string]int64{}
+	blocks := map[string]bool{}
 	for _, item := range s.Content.Values() {
 		switch item.Kind {
 		case "seed":
@@ -153,15 +132,8 @@ func validateRestoredContent(s *State, derived *derivedFileInfo) {
 			if item.ID != s.SeedHash {
 				fail("Unsupported task snapshot")
 			}
-			if item.Bytes != nil {
-				fail("Unsupported task snapshot")
-			}
 		case "block":
-			if item.Bytes == nil {
-				fail("Unsupported task snapshot")
-			}
-			integer(*item.Bytes, 1)
-			blocks[item.ID] = *item.Bytes
+			blocks[item.ID] = true
 		default:
 			fail("Unsupported task snapshot")
 		}
@@ -179,13 +151,8 @@ func validateRestoredContent(s *State, derived *derivedFileInfo) {
 		fail("Content key mismatch")
 	}
 	for _, id := range derived.order {
-		want := derived.blocks[id]
-		got, ok := blocks[id]
-		if !ok {
+		if !blocks[id] {
 			fail("Content key mismatch")
-		}
-		if got != want {
-			fail("Conflicting content identity")
 		}
 	}
 }

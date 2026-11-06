@@ -1,17 +1,13 @@
 /** 金额使用规范十进制聪字符串；快照不包含BigInt、时钟或资源句柄。 */
 export type Sats = string;
 /**
- * 一个可计价的内容对象。
- * Seed 不携带 `bytes`（Seed 大小未知，不做总量上限校验）；块由 `(索引, fileBytes, blockBytes)` 推导长度。
+ * 一个可计价的内容对象。内容身份只看 Hash，不保存字节数；
+ * 验收后的实际字节是执行统计，只用于测速，不参与身份和完成判定。
  */
-export interface Content { id: string; kind: "seed" | "block"; bytes?: number }
+export interface Content { id: string; kind: "seed" | "block" }
 /** 文件结构：完整有序块哈希清单（含重复位置）。`null` 表示种子尚未知。 */
 export interface Manifest {
-  /** 原文件字节数；0 表示已知空文件。 */
-  fileBytes: number;
-  /** 标准块大小（字节），>= 1。 */
-  blockBytes: number;
-  /** 完整有序块哈希清单；空文件时为 []。 */
+  /** 完整有序块哈希清单；已知空文件时为 []。 */
   blockHashes: string[];
 }
 export interface Fees {
@@ -23,8 +19,8 @@ export interface Fees {
 }
 export interface Quote {
   id: string; version: number; sellerId: string; sessionId: string;
-  expiresAt: number; blockPrice: Sats; seedPrice: Sats; blockBytes: number;
-  /** 可选的协议尾块报价；未提供时按字节比例向上取整。 */
+  expiresAt: number; blockPrice: Sats; seedPrice: Sats;
+  /** 清单末项 Hash 的报价；未提供时回退到 blockPrice。 */
   tailPrice?: Sats;
   maxBlocks: number; fees: Fees;
   /** 未指定时表示拥有全部内容；已开池保留绑定价格。 */
@@ -48,7 +44,7 @@ export interface Slider {
 }
 export interface Seller {
   id: string; online: boolean; quote: Quote | null;
-  /** 累计已验收交付的块字节；有尝试无字节只累计时间。 */
+  /** 累计已验收交付的正文块字节（delivery.acceptedBlockBytes 求和）；有尝试无字节只累计时间。 */
   bytesTotal: number;
   /** 累计传输耗时（毫秒）：成功交付用交付墙钟，失败尝试按请求时长累计。 */
   timeMsTotal: number;
@@ -64,7 +60,7 @@ export interface Seller {
 /** 池资金状态；`problem` 表示结果未知或资金待清理，已移出任务调度，由宿主记录并事后处理。 */
 export type PoolFunding = "opening" | "open" | "closing" | "closed" | "failed" | "problem";
 export interface Pool {
-  id: string; taskId: string; sellerId: string; sessionId: string;
+  id: string; sellerId: string; sessionId: string;
   /** 自动开池时的历史报价，仅供审计，不限制后续购买报价。 */
   quote?: Quote;
   openingFee: Sats;
@@ -82,7 +78,7 @@ export interface Request {
   transferredBytes: number; state: "planned" | "pending" | "unresolved" | "settled" | "rejected";
 }
 export interface State {
-  version: 1; taskId: string; seedHash: string; revision: number; sequence: number; now: number;
+  version: 1; seedHash: string; revision: number; sequence: number; now: number;
   config: Config; intent: "ready" | "run" | "pause" | "cancel";
   /** 终态错误：停止新增工作，但在途和资金责任继续处理。 */
   failure: { code: "insufficient-funds"; sellerId: string; required: Sats } | null;
@@ -104,7 +100,7 @@ export type Payload =
   | { type: "limits"; maxBlockPrice?: Sats; baseSeats?: number; floatingSeats?: number }
   | { type: "slider"; slider: "price"; value: string }
   | { type: "automatic"; slider: "price" }
-  | { type: "manifest"; fileBytes: number; blockBytes: number; blockHashes: string[]; reusedBlockHashes?: string[] }
+  | { type: "manifest"; blockHashes: string[]; reusedBlockHashes?: string[] }
   | { type: "quote"; quote: Quote }
   | { type: "quote-source"; enabled: boolean }
   | { type: "quotes-requested" | "quotes-request-failed"; commandId: string }
@@ -117,15 +113,15 @@ export type Payload =
   | { type: "unknown"; poolId: string; commandId: string }
   | { type: "progress"; requestId: string; bytes: number }
   /** 可信执行结果：接受的内容必须已验收，且付款责任已对清。 */
-  | { type: "delivery"; requestId: string; accepted: string[]; paid: Sats; startedAt: number; endedAt: number }
+  | { type: "delivery"; requestId: string; accepted: string[]; paid: Sats; acceptedBlockBytes: number; startedAt: number; endedAt: number }
   | { type: "request-rejected"; requestId: string; safeToRetry: boolean }
   | { type: "closed"; poolId: string; commandId: string; returned: Sats; spent: Sats }
   | { type: "refund-available"; poolId: string };
 export type Event = Payload & {
-  eventId: string; taskId: string; occurredAt: number; receivedAt: number;
+  eventId: string; seedHash: string; occurredAt: number; receivedAt: number;
 };
 export interface CommandBase {
-  commandId: string; taskId: string; revision: number; reason: string;
+  commandId: string; seedHash: string; revision: number; reason: string;
 }
 export type Command = CommandBase & (
   | { type: "discover" }
@@ -152,7 +148,7 @@ export interface SellerSpeedView {
   lastAt: number | null;
 }
 export interface View {
-  taskId: string; revision: number;
+  seedHash: string; revision: number;
   execution: "ready" | "running" | "waiting" | "paused" | "stopping" | "stopped" | "finished";
   failure: State["failure"];
   content: "manifest-unknown" | "incomplete" | "complete";
@@ -172,18 +168,15 @@ export interface View {
 }
 export interface Result { state: State; commands: Command[]; view: View; nextWakeAt: number | null }
 /**
- * 创建任务输入。只提供 `seedHash` 时内核先购买 Seed；提供完整文件信息
- * （`fileBytes/blockBytes/blockHashes` 三者同给）时内核认定宿主已验证本地 Seed，跳过购买。
+ * 创建任务输入。省略 `resume` 时清单未知，内核先购买 Seed；提供 `resume`
+ * 时声明宿主已验证本地 Seed，内核跳过购买，只采购缺失块。
  */
 export interface CreateTaskInput {
-  taskId: string;
   seedHash: string;
-  /** 原文件字节数；0 表示已知空文件。 */
-  fileBytes?: number;
-  /** 标准块大小（字节），>= 1。 */
-  blockBytes?: number;
-  /** 完整有序块哈希清单（含重复位置）；长度必须等于 ceil(fileBytes / blockBytes)。 */
-  blockHashes?: string[];
-  /** 宿主已按本地字节重验的块；只允许属于清单的块。 */
-  reusedBlockHashes?: string[];
+  resume?: {
+    /** 完整有序块哈希清单（含重复位置）；[] 表示已知没有正文块。 */
+    blockHashes: string[];
+    /** 宿主已按本地字节重验的块；只允许属于清单的块。 */
+    reusedBlockHashes?: string[];
+  };
 }

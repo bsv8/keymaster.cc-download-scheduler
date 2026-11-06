@@ -77,20 +77,17 @@ func reserve(fees Fees, count int64) *big.Int {
 	return result
 }
 
-func price(quote Quote, content Content) *big.Int {
+func price(quote Quote, content Content, isTail bool) *big.Int {
 	if content.Kind == "seed" {
 		return sats(quote.SeedPrice)
 	}
-	bytes := contentBytesOf(content)
-	if bytes < quote.BlockBytes && quote.TailPrice != nil {
-		return sats(*quote.TailPrice)
+	if isTail {
+		if quote.TailPrice != nil {
+			return sats(*quote.TailPrice)
+		}
+		return sats(quote.BlockPrice)
 	}
-	// Quote declares a full block size; a tail block pays the byte ratio
-	// rounded up with integer arithmetic.
-	numerator := new(big.Int).Mul(sats(quote.BlockPrice), big.NewInt(bytes))
-	denominator := big.NewInt(quote.BlockBytes)
-	numerator.Add(numerator, new(big.Int).Sub(denominator, big.NewInt(1)))
-	return numerator.Div(numerator, denominator)
+	return sats(quote.BlockPrice)
 }
 
 func validateFees(fees Fees) {
@@ -110,7 +107,6 @@ func validateQuote(quote Quote) {
 	}
 	integer(quote.Version, 0)
 	integer(quote.ExpiresAt, 0)
-	integer(quote.BlockBytes, 1)
 	integer(quote.MaxBlocks, 1)
 	sats(quote.BlockPrice)
 	sats(quote.SeedPrice)

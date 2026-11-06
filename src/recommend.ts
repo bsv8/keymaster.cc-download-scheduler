@@ -1,4 +1,5 @@
 import { price, sats } from "./math.js";
+import { tailBlockId } from "./manifest.js";
 import type { Quote, SliderView, State, View } from "./types.js";
 
 export function pendingContent(s: State) {
@@ -9,7 +10,7 @@ export function availableContent(s: State, q: Quote) {
     && (c.kind === "seed" || !Object.values(s.content).some(x => x.kind === "seed" && !s.completed[x.id])));
 }
 /**
- * 卖家速度事实：累计已验收交付的块字节 ÷ 累计传输耗时。
+ * 卖家速度事实：累计已验收交付的正文块实际字节 ÷ 累计传输耗时。
  * 长期保留、没有窗口、没有过期；未测速返回 null；测过但零字节返回 0，二者分开。
  */
 export function sellerSpeed(s: State, sellerId: string): number | null {
@@ -98,10 +99,12 @@ export function view(s: State): View {
     else reasons.push("awaiting-resources");
   }
   let costMin = 0n, costMax = 0n, covered = true;
+  const tail = tailBlockId(s.manifest);
   for (const item of pendingContent(s)) {
     const request = Object.values(s.requests).find(r => ["planned", "pending", "unresolved"].includes(r.state) && r.contentIds.includes(item.id));
+    const isTail = item.kind === "block" && item.id === tail;
     const prices = request ? [sats(request.prices[item.id])] : rec.quotes
-      .filter(q => !q.contentIds || q.contentIds.includes(item.id)).map(q => price(q, item));
+      .filter(q => !q.contentIds || q.contentIds.includes(item.id)).map(q => price(q, item, isTail));
     if (!prices.length) { covered = false; break; }
     costMin += prices.reduce((a, b) => a < b ? a : b);
     costMax += prices.reduce((a, b) => a > b ? a : b);
@@ -115,7 +118,7 @@ export function view(s: State): View {
   const unmeasuredEligible = rec.quotes.filter(q => sellerSpeed(s, q.sellerId) === null).length;
   const blacklisted = Object.values(s.sellers).filter(x => x.blacklisted).length;
   return {
-    taskId: s.taskId, revision: s.revision,
+    seedHash: s.seedHash, revision: s.revision,
     failure: s.failure,
     execution: s.failure ? (requests.length || Object.values(s.requests).some(r => r.state === "planned") ? "stopping" : "stopped") : complete ? "finished" : s.intent === "ready" ? "ready"
       : s.intent === "cancel" ? (requests.length ? "stopping" : "stopped")

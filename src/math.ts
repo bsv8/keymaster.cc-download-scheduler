@@ -1,11 +1,5 @@
 import type { Content, Fees, Quote, Sats } from "./types.js";
 
-/** 块的字节数；Seed 不携带 bytes，调用方只对块调用（缺失表示内部不变量被破坏）。 */
-export function contentBytes(content: Content): number {
-  if (content.bytes === undefined) throw new Error("Content bytes missing");
-  return content.bytes;
-}
-
 export function sats(value: Sats): bigint {
   if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value)) throw new Error("Invalid integer sats");
   return BigInt(value);
@@ -21,12 +15,14 @@ export function identity(value: string): string {
 export function reserve(fees: Fees, count: number): bigint {
   return sats(fees.settlement) + sats(fees.arbitrationBase) + sats(fees.arbitrationPerItem) * BigInt(count);
 }
-export function price(quote: Quote, content: Content): bigint {
+/**
+ * 内容报价：Seed 用 seedPrice；清单末项 Hash 用 tailPrice（缺省回退 blockPrice）；
+ * 其余正文用 blockPrice。`isTail` 由调用方按不可变清单推导。
+ */
+export function price(quote: Quote, content: Content, isTail: boolean): bigint {
   if (content.kind === "seed") return sats(quote.seedPrice);
-  const bytes = contentBytes(content);
-  if (bytes < quote.blockBytes && quote.tailPrice !== undefined) return sats(quote.tailPrice);
-  // 报价声明完整块大小；尾块按字节比例进行整数向上取整。
-  return (sats(quote.blockPrice) * BigInt(bytes) + BigInt(quote.blockBytes) - 1n) / BigInt(quote.blockBytes);
+  if (isTail) return sats(quote.tailPrice ?? quote.blockPrice);
+  return sats(quote.blockPrice);
 }
 export function validateFees(f: Fees) {
   integer(f.version); sats(f.opening); sats(f.settlement); sats(f.arbitrationBase); sats(f.arbitrationPerItem);
@@ -34,7 +30,7 @@ export function validateFees(f: Fees) {
 export function validateQuote(q: Quote) {
   identity(q.id); identity(q.sellerId); identity(q.sessionId);
   for (const id of q.contentIds ?? []) identity(id);
-  integer(q.version); integer(q.expiresAt); integer(q.blockBytes, 1);
+  integer(q.version); integer(q.expiresAt);
   integer(q.maxBlocks, 1);
   sats(q.blockPrice); sats(q.seedPrice);
   if (q.tailPrice !== undefined) sats(q.tailPrice);

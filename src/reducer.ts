@@ -1,6 +1,6 @@
-import { identity, integer, price, sats, validateFees, validateQuote, contentBytes } from "./math.js";
-import { deriveFileInfo, parseFileInfo, sameManifest } from "./manifest.js";
-import type { Event, Seller, State } from "./types.js";
+import { identity, integer, price, sats, validateFees, validateQuote } from "./math.js";
+import { deriveFileInfo, parseManifestPayload, sameManifest, tailBlockId } from "./manifest.js";
+import type { Event, Quote, Seller, State } from "./types.js";
 
 function ensureSeller(s: State, id: string, online: boolean): Seller {
   return s.sellers[id] ??= {
@@ -16,7 +16,7 @@ export function recordFailedAttempt(seller: Seller, bytes: number, startedAt: nu
   seller.measured = true; seller.lastAt = at;
 }
 
-/** 登记 Seed（无字节数）；每个任务恰好一个，id 等于 seedHash。 */
+/** 登记 Seed；每个任务恰好一个，id 等于 seedHash。 */
 export function registerSeed(s: State) {
   s.content[s.seedHash] = { id: s.seedHash, kind: "seed" };
 }
@@ -25,7 +25,7 @@ export function registerSeed(s: State) {
  * 追加复用块（可重复调用）：不能覆盖购买记录、不能解除未决认领。
  * 已 purchased 的块保持 purchased；已 reused 的块不变。
  */
-export function markReused(s: State, reused: string[], blocks: Map<string, number>) {
+export function markReused(s: State, reused: string[], blocks: Set<string>) {
   const unique = [...new Set(reused)];
   for (const id of unique) {
     if (!blocks.has(id)) throw new Error("Unknown reused content");
@@ -43,16 +43,16 @@ export function markReused(s: State, reused: string[], blocks: Map<string, numbe
 
 /** 已校验的文件信息写入状态：登记唯一块、标记复用块、记录清单。 */
 export function applyFileInfo(s: State, derived: ReturnType<typeof deriveFileInfo>, reused: string[] = []) {
-  for (const [id, bytes] of derived.blocks) {
+  for (const id of derived.blocks) {
     const old = s.content[id];
     if (old) {
-      if (old.kind !== "block" || old.bytes !== bytes) throw new Error("Conflicting content identity");
+      if (old.kind !== "block") throw new Error("Conflicting content identity");
       continue;
     }
-    s.content[id] = { id, kind: "block", bytes };
+    s.content[id] = { id, kind: "block" };
   }
   markReused(s, reused, derived.blocks);
-  s.manifest = { fileBytes: derived.manifest.fileBytes, blockBytes: derived.manifest.blockBytes, blockHashes: [...derived.manifest.blockHashes] };
+  s.manifest = { blockHashes: [...derived.manifest.blockHashes] };
 }
 
 export function reduce(s: State, e: Event) {
@@ -93,9 +93,8 @@ export function reduce(s: State, e: Event) {
       if (e.slider !== "price") throw new Error("Invalid slider");
       s.price.mode = "auto"; break;
     case "manifest": {
-      if (e.fileBytes === undefined || e.blockBytes === undefined || !Array.isArray(e.blockHashes)) throw new Error("Invalid manifest");
-      const parsed = parseFileInfo(s.seedHash, e);
-      if (!parsed) throw new Error("Invalid manifest");
+      if (!Array.isArray(e.blockHashes)) throw new Error("Invalid manifest");
+      const parsed = parseManifestPayload(s.seedHash, e);
       if (s.manifest) {
         // 清单（含顺序与重复次数）一旦确定不得变更；相同信息重复提供时只允许追加合法复用块。
         if (!sameManifest(s.manifest, parsed.derived.manifest)) throw new Error("Conflicting manifest");
@@ -106,8 +105,10 @@ export function reduce(s: State, e: Event) {
       break;
     }
     case "quote": {
-      validateQuote(e.quote);
-      const q = e.quote;
+      // 旧报价字段在入口忽略并移除，保证成功生成的状态可恢复；新调用方不得再传。
+      const { blockBytes: _removed, ...clean } = e.quote as Quote & { blockBytes?: unknown };
+      validateQuote(clean);
+      const q = clean;
       const seller = ensureSeller(s, q.sellerId, true);
       if (!seller.quote || q.version > seller.quote.version) seller.quote = { ...q };
       break;
@@ -133,7 +134,7 @@ export function reduce(s: State, e: Event) {
         break;
       }
       ensureSeller(s, e.sellerId, true);
-      s.pools[e.poolId] = { id: e.poolId, taskId: s.taskId, sellerId: e.sellerId, sessionId: e.sessionId,
+      s.pools[e.poolId] = { id: e.poolId, sellerId: e.sellerId, sessionId: e.sessionId,
         openingFee: "0", fees: { ...e.fees }, amount: e.amount, committed: e.committed,
         blockCapacity: 0, purchasedBlocks: 0, funding: "open", scheduling: "idle",
         openCommandId: "", closeCommandId: null, requestId: null, drainReason: null,
@@ -181,12 +182,6 @@ export function reduce(s: State, e: Event) {
       const r = s.requests[e.requestId];
       if (!r || r.state !== "pending") break;
       integer(e.bytes);
-      const items = r.contentIds.map(id => s.content[id]);
-      // Seed 字节未知：只跳过上限校验，进度推进与停摆判定照旧。
-      if (items.every(item => item.bytes !== undefined)) {
-        const size = items.reduce((n, item) => n + contentBytes(item), 0);
-        if (e.bytes > size) throw new Error("Impossible transfer progress");
-      }
       if (e.bytes > r.transferredBytes) { r.transferredBytes = e.bytes; r.lastProgressAt = s.now; }
       break;
     }
@@ -201,23 +196,28 @@ export function reduce(s: State, e: Event) {
       integer(e.startedAt); integer(e.endedAt, e.startedAt + 1);
       if (e.endedAt > s.now) throw new Error("Future delivery");
       if (new Set(e.accepted).size !== e.accepted.length || e.accepted.some(id => !r.contentIds.includes(id))) throw new Error("Invalid accepted content");
+      integer(e.acceptedBlockBytes, 0);
+      const acceptedBlocks = e.accepted.filter(id => s.content[id].kind === "block");
+      // acceptedBlockBytes 仅统计本次 accepted 中已通过 Hash 验收的正文块实际字节，
+      // 不含 Seed，不按重复位置倍增。协议正文载荷非空（BitFSProtocol content），
+      // 宿主已验正文时合计必为正；无正文时必须为零。
+      if (acceptedBlocks.length === 0 ? e.acceptedBlockBytes !== 0 : e.acceptedBlockBytes <= 0) throw new Error("Invalid accepted bytes");
       const expected = e.accepted.reduce((n, id) => n + sats(r.prices[id]), 0n);
       if (sats(e.paid) !== expected) throw new Error("Payment differs from authorization");
       if (sats(p.committed) + expected > sats(p.amount)) throw new Error("Pool overspend");
       p.committed = String(sats(p.committed) + expected);
-      p.purchasedBlocks += e.accepted.filter(id => s.content[id].kind === "block").length;
+      p.purchasedBlocks += acceptedBlocks.length;
       s.spent = String(sats(s.spent) + expected);
       r.state = "settled"; p.requestId = null;
       for (const id of e.accepted) s.completed[id] = "purchased";
       const seller = s.sellers[p.sellerId];
-      const bytes = e.accepted.filter(id => s.content[id].kind === "block").reduce((n, id) => n + contentBytes(s.content[id]), 0);
       if (!e.accepted.length) {
         // 确定失败：验收为空（坏块 / 内容校验失败）→ 本任务立即拉黑该卖家。
         seller.blacklisted = true; seller.failureCount++;
         recordFailedAttempt(seller, 0, e.startedAt, e.endedAt);
-      } else if (bytes > 0) {
-        // 累计口径：只统计已验收交付的块字节与墙钟耗时。
-        seller.bytesTotal += bytes;
+      } else if (acceptedBlocks.length > 0) {
+        // 累计口径：只统计已验收交付的正文块实际字节与墙钟耗时。
+        seller.bytesTotal += e.acceptedBlockBytes;
         seller.timeMsTotal += e.endedAt - e.startedAt;
         seller.measured = true; seller.lastAt = e.endedAt;
       }
@@ -255,7 +255,11 @@ export function reduce(s: State, e: Event) {
 }
 
 export function assertRequestPrices(s: State) {
+  const tail = tailBlockId(s.manifest);
   for (const r of Object.values(s.requests)) {
-    for (const id of r.contentIds) if (sats(r.prices[id]) !== price(r.quote, s.content[id])) throw new Error("Corrupt request prices");
+    for (const id of r.contentIds) {
+      const item = s.content[id];
+      if (sats(r.prices[id]) !== price(r.quote, item, item.kind === "block" && id === tail)) throw new Error("Corrupt request prices");
+    }
   }
 }

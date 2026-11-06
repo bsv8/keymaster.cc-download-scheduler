@@ -4,23 +4,28 @@ TypeScript 文件采购策略器，唯一源码位于本仓 `src/`；钱包消�
 
 ## 构建与使用
 
-Node.js 22、TypeScript 5.9。本仓运行 `pnpm install && pnpm build`，或使用 TypeScript 编译器执行 `tsc -p tsconfig.json`，输出到 `dist/`；消费前先构建，包导出仅指向 `dist/`。本版本 npm 清单为 `keymaster-trade-scheduler@0.2.0`，npm 上传独立执行，是否已公开以 registry 为准。宿主使用已发布的精确版本，不使用本地 `file:` 或源码 alias 冒充发布依赖。Go 在仓库根目录运行 `go build ./...`，仅依赖标准库；Go 使用根标签 `v0.2.0` 发布，不使用 `go/v...`；导入 `github.com/bsv8/keymaster.cc-download-scheduler/scheduler`，构建不依赖 Node.js。
+Node.js 22、TypeScript 5.9。本仓运行 `pnpm install && pnpm build`，或使用 TypeScript 编译器执行 `tsc -p tsconfig.json`，输出到 `dist/`；消费前先构建，包导出仅指向 `dist/`。本版本 npm 清单为 `keymaster-trade-scheduler@0.3.0`，npm 上传独立执行，是否已公开以 registry 为准。宿主使用已发布的精确版本，不使用本地 `file:` 或源码 alias 冒充发布依赖。Go 在仓库根目录运行 `go build ./...`，仅依赖标准库；Go 使用根标签 `v0.3.0` 发布，不使用 `go/v...`；导入 `github.com/bsv8/keymaster.cc-download-scheduler/scheduler`，构建不依赖 Node.js。
 
 ```ts
-import { createTask, step, restoreTask } from 'keymaster-trade-scheduler';
+import { createDownloadScheduler, step, restoreTask } from 'keymaster-trade-scheduler';
 
-let state = createTask({
-  taskId: 'purchase-1', seedHash: 'file-seed-hash', manifestKnown: true,
-  content: [{ id: 'block-hash-1', kind: 'block', bytes: 262144 }],
-  config: {
-    maxBlockPrice: '10', // 未设置任务价格杆时的缺省完整块最高价
-    baseSeats: 6, floatingSeats: 2,
-    poolBlocks: 4, // 单次请求上限，不限制池的累计购买量
-    requestTimeoutMs: 5000, // 无新字节的停摆时限
-  },
+const scheduler = createDownloadScheduler({
+  maxBlockPrice: '10', // 未设置任务价格杆时的缺省块最高价
+  baseSeats: 6, floatingSeats: 2,
+  poolBlocks: 4, // 单次请求上限，不限制池的累计购买量
+  requestTimeoutMs: 5000, // 无新字节的停摆时限
+});
+
+// 新建：清单未知，先买 Seed。
+let state = scheduler.createTask({ seedHash: 'file-seed-hash' });
+
+// 续传：宿主已验证本地 Seed，只买缺失块；[] 表示已知没有正文块。
+state = scheduler.createTask({
+  seedHash: 'file-seed-hash',
+  resume: { blockHashes: ['block-hash-1'], reusedBlockHashes: [] },
 });
 const result = step(state, {
-  type: 'start', eventId: 'event-1', taskId: state.taskId,
+  type: 'start', eventId: 'event-1', seedHash: state.seedHash,
   occurredAt: 0, receivedAt: 0,
 });
 state = result.state;
@@ -39,8 +44,8 @@ sink 异常不能改变决策，输入/输出经分离脱敏，不输出秘密�
 
 ## 策略
 
-- 最高完整块价决定准入；上限内速度优先，不选择便宜卖家弥补资金不足，不提供价格偏好、任务总支出授权或自动价格建议。
-- 席位上限为基础名额加浮动名额；未测速在席数不超过浮动名额。速度按长期累计有效块字节除以累计耗时计算，未测速与已测零速不同。
+- 块最高价决定准入；上限内速度优先，不选择便宜卖家弥补资金不足，不提供价格偏好、任务总支出授权或自动价格建议。清单末项 Hash 使用 `tailPrice`（缺省回退 `blockPrice`），不改变准入与席位选择。
+- 席位上限为基础名额加浮动名额；未测速在席数不超过浮动名额。速度按长期累计已验收正文实际字节除以累计耗时计算，未测速与已测零速不同。
 - 每次购买结果明确后，只评审对应卖家，按基础排名及候补一换一；其他在途卖家不被打断，没有全局轮次。
 - 先安排卖家及具体内容，再配资金。工作进入 `planned` 后即排他占用内容；池可用后执行同一份工作。
 - 已测在席卖家按累计速度降序获得工作和资金；未测速者按可重放随机顺序。
@@ -54,7 +59,8 @@ sink 异常不能改变决策，输入/输出经分离脱敏，不输出秘密�
 
 - 命令为 `discover / open / download / drain / close`；`discover` 是保留的报价发现候选接口，钱包尚未接入，不能视为已确定的自动重查政策。`open` 携带排他的 `requestId / contentIds`；`download` 携带独立报价、逐项价格及最大付款。
 - 不接受钱包余额／版本事件，不维护 `reflectedCommands` 或本地钱包预算扣减。钱包输入只由 UTXO manager 申请和冻结；内核保存的池状态属于采购／结算业务。
-- `opened / pool-available` 是真实可用池事实；`delivery` 是内容已验收、付款责任已明确的事实。
+- `opened / pool-available` 是真实可用池事实；`delivery` 是内容已验收、付款责任已明确的事实，必填已验收正文实际字节用于测速。
+- 内容身份只看 Hash；清单末项为尾块，报价缺省回退块价；`progress` 只做累计传输与停摆判定，不做长度上限校验。
 - `closed / refund-available` 分别确认池关闭和回款事实；内核不计算钱包余额。
 - `fees` 只能输入确实适用于对应池的费用事实。池合同变化不能由宿主静默改写命令。
 - `view` 分开表达执行、内容和资金状态，并保留任务失败原因。仲裁和结算预留不属于实际支出。
